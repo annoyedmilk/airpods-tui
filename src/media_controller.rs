@@ -73,21 +73,29 @@ enum AudioCommand {
 
 /// Spawn a single background thread that owns the PulseAudio Mainloop + Context.
 /// Returns a sender for issuing commands.
-fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
+fn spawn_audio_thread(
+    app_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+) -> std::sync::mpsc::Sender<AudioCommand> {
     let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
 
     std::thread::spawn(move || {
+        let fail = |msg: &str| {
+            error!("{}", msg);
+            if let Some(ref tx) = app_tx {
+                let _ = tx.send(crate::tui::app::AppEvent::AudioUnavailable);
+            }
+        };
         let mut mainloop = match Mainloop::new() {
             Some(m) => m,
             None => {
-                error!("Failed to create PulseAudio mainloop");
+                fail("Failed to create PulseAudio mainloop");
                 return;
             }
         };
         let mut context = match Context::new(&mainloop, "airpods-tui") {
             Some(c) => c,
             None => {
-                error!("Failed to create PulseAudio context");
+                fail("Failed to create PulseAudio context");
                 return;
             }
         };
@@ -95,7 +103,7 @@ fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
             .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
             .is_err()
         {
-            error!("Failed to connect PulseAudio context");
+            fail("Failed to connect PulseAudio context");
             return;
         }
 
@@ -106,7 +114,7 @@ fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
                 _ if context.get_state() == libpulse_binding::context::State::Failed
                     || context.get_state() == libpulse_binding::context::State::Terminated =>
                 {
-                    error!("PulseAudio context failed during connect");
+                    fail("PulseAudio context failed during connect");
                     return;
                 }
                 _ => {}
@@ -502,11 +510,15 @@ struct MediaControllerState {
     playback_listener_running: bool,
     config: Config,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
+    session_conn: Option<zbus::Connection>,
 }
 
 impl MediaControllerState {
-    fn new(config: Config) -> Self {
-        let audio_tx = spawn_audio_thread();
+    fn new(
+        config: Config,
+        app_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+    ) -> Self {
+        let audio_tx = spawn_audio_thread(app_tx);
         MediaControllerState {
             connected_device_mac: String::new(),
             local_mac: String::new(),
@@ -524,6 +536,7 @@ impl MediaControllerState {
             playback_listener_running: false,
             config,
             audio_tx,
+            session_conn: None,
         }
     }
 }
@@ -534,12 +547,35 @@ pub struct MediaController {
 }
 
 impl MediaController {
-    pub fn new(connected_mac: String, local_mac: String, config: Config) -> Self {
-        let mut state = MediaControllerState::new(config);
+    pub fn new(
+        connected_mac: String,
+        local_mac: String,
+        config: Config,
+        app_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+    ) -> Self {
+        let mut state = MediaControllerState::new(config, app_tx);
         state.connected_device_mac = connected_mac;
         state.local_mac = local_mac;
         MediaController {
             state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    /// Get or create a cached session D-Bus connection for MPRIS calls.
+    async fn session_conn(&self) -> Option<zbus::Connection> {
+        let mut state = self.state.lock().await;
+        if let Some(ref conn) = state.session_conn {
+            return Some(conn.clone());
+        }
+        match zbus::Connection::session().await {
+            Ok(conn) => {
+                state.session_conn = Some(conn.clone());
+                Some(conn)
+            }
+            Err(e) => {
+                error!("Failed to connect to session D-Bus: {}", e);
+                None
+            }
         }
     }
 
@@ -579,7 +615,7 @@ impl MediaController {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let is_playing = Self::check_if_playing_async().await;
+            let is_playing = self.check_if_playing_async().await;
 
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
@@ -631,8 +667,8 @@ impl MediaController {
         }
     }
 
-    async fn check_if_playing_async() -> bool {
-        let Ok(conn) = zbus::Connection::session().await else { return false };
+    async fn check_if_playing_async(&self) -> bool {
+        let Some(conn) = self.session_conn().await else { return false };
         let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else { return false };
         let Ok(names) = proxy.list_names().await else { return false };
 
@@ -858,10 +894,7 @@ impl MediaController {
     async fn pause(&self) {
         debug!("Pausing playback");
 
-        let Ok(conn) = zbus::Connection::session().await else {
-            error!("Failed to connect to session D-Bus for pause");
-            return;
-        };
+        let Some(conn) = self.session_conn().await else { return };
         let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
         let Ok(names) = dbus.list_names().await else { return };
         let mut paused_services = Vec::new();
@@ -896,7 +929,7 @@ impl MediaController {
     }
 
     async fn mpris_call_first(&self, method: &str) {
-        let Ok(conn) = zbus::Connection::session().await else { return };
+        let Some(conn) = self.session_conn().await else { return };
         let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
         let Ok(names) = dbus.list_names().await else { return };
         for name in names {
@@ -931,7 +964,7 @@ impl MediaController {
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
 
-        let Ok(conn) = zbus::Connection::session().await else { return };
+        let Some(conn) = self.session_conn().await else { return };
         let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
         let Ok(names) = dbus.list_names().await else { return };
         let mut paused_count = 0;
@@ -976,7 +1009,7 @@ impl MediaController {
             return;
         }
 
-        let Ok(conn) = zbus::Connection::session().await else { return };
+        let Some(conn) = self.session_conn().await else { return };
         let mut resumed_count = 0;
         for service in &services {
             if Self::is_kdeconnect_service(service) {

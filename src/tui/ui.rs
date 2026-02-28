@@ -423,8 +423,8 @@ fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'
     ]))
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
-    let keys = Line::from(vec![
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![
         Span::styled("q", Style::default().fg(ACCENT)),
         Span::styled(" quit", Style::default().fg(DIM)),
         Span::styled("  Tab", Style::default().fg(ACCENT)),
@@ -437,8 +437,11 @@ fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
         Span::styled(" noise", Style::default().fg(DIM)),
         Span::styled("  r", Style::default().fg(ACCENT)),
         Span::styled(" rename", Style::default().fg(DIM)),
-    ]);
-    f.render_widget(Paragraph::new(keys).alignment(Alignment::Center), area);
+    ];
+    if app.audio_unavailable {
+        spans.push(Span::styled("  PulseAudio unavailable", Style::default().fg(Color::Red)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), area);
 }
 
 fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {

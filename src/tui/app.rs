@@ -14,6 +14,7 @@ pub enum AppEvent {
     DeviceConnected { mac: String, name: String, is_nothing: bool, product_id: u16 },
     DeviceDisconnected(String),
     AACPEvent(String, AACPEvent),
+    AudioUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,7 @@ pub struct App {
     pub should_quit: bool,
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, DeviceCommand)>>,
     pub rename_mode: Option<String>,
+    pub audio_unavailable: bool,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
             should_quit: false,
             command_tx: Some(command_tx),
             rename_mode: None,
+            audio_unavailable: false,
         }
     }
 
@@ -291,6 +294,9 @@ impl App {
                 }
                 AppEvent::AACPEvent(mac, event) => {
                     self.handle_aacp_event(&mac, event);
+                }
+                AppEvent::AudioUnavailable => {
+                    self.audio_unavailable = true;
                 }
             }
         }

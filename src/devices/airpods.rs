@@ -151,6 +151,7 @@ impl AirPodsDevice {
             mac_address.to_string(),
             local_mac.clone(),
             config,
+            Some(app_tx.clone()),
         )));
         let mc_clone = media_controller.clone();
 
