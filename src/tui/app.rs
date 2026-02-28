@@ -342,7 +342,7 @@ impl App {
                     if let Some((l, _)) = state.battery_left { content.push_str(&format!("LEFT={}\n", l)); }
                     if let Some((r, _)) = state.battery_right { content.push_str(&format!("RIGHT={}\n", r)); }
                     if let Some((c, _)) = state.battery_case { content.push_str(&format!("CASE={}\n", c)); }
-                    let _ = std::fs::write("/tmp/airpods-battery.env", content);
+                    let _ = std::fs::write(crate::utils::runtime_dir().join("airpods-battery.env"), content);
                 }
                 AACPEvent::DeviceInfo(info) => {
                     if !info.name.is_empty() {

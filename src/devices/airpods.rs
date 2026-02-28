@@ -21,7 +21,7 @@ impl AirPodsDevice {
         app_tx: UnboundedSender<AppEvent>,
         product_id: u16,
         config: Config,
-    ) -> Self {
+    ) -> Result<Self, bluer::Error> {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
         aacp_manager.connect(mac_address).await;
@@ -134,18 +134,9 @@ impl AirPodsDevice {
         }
 
         // ── Media controller setup ──
-        let session = bluer::Session::new()
-            .await
-            .expect("Failed to get bluer session");
-        let adapter = session
-            .default_adapter()
-            .await
-            .expect("Failed to get default adapter");
-        let local_mac = adapter
-            .address()
-            .await
-            .expect("Failed to get adapter address")
-            .to_string();
+        let session = bluer::Session::new().await?;
+        let adapter = session.default_adapter().await?;
+        let local_mac = adapter.address().await?.to_string();
 
         let media_controller = Arc::new(Mutex::new(MediaController::new(
             mac_address.to_string(),
@@ -281,9 +272,9 @@ impl AirPodsDevice {
         // media_controller and mac_address are used by spawned tasks above
         // but not needed in the struct after initialization
         let _ = media_controller;
-        AirPodsDevice {
+        Ok(AirPodsDevice {
             aacp_manager,
-        }
+        })
     }
 }
 

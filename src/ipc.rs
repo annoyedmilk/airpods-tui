@@ -7,11 +7,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
 pub fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("airpods-tui.sock")
-    } else {
-        PathBuf::from("/tmp/airpods-tui.sock")
-    }
+    crate::utils::runtime_dir().join("airpods-tui.sock")
 }
 
 async fn write_msg(stream: &mut (impl AsyncWriteExt + Unpin), data: &[u8]) -> std::io::Result<()> {

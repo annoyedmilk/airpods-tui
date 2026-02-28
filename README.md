@@ -67,7 +67,7 @@ airpods-tui                 # launch TUI
 airpods-tui --daemon        # run as background daemon (no TUI)
 airpods-tui --waybar        # print JSON status and exit
 airpods-tui --waybar-watch  # persistent JSON output on changes
-airpods-tui -d              # enable debug logging (/tmp/airpods-tui.log)
+airpods-tui -d              # enable debug logging ($XDG_RUNTIME_DIR/airpods-tui.log)
 ```
 
 ## Keys

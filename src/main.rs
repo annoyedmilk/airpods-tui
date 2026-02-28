@@ -21,7 +21,7 @@ use crossterm::{
 };
 use devices::airpods::AirPodsDevice;
 use futures::StreamExt;
-use log::info;
+use log::{debug, info};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::collections::HashMap;
@@ -79,14 +79,26 @@ async fn zbus_get_property<T: TryFrom<zbus::zvariant::OwnedValue>>(
     property: &str,
 ) -> Option<T> {
     let obj_path = zbus::zvariant::ObjectPath::try_from(path).ok()?;
-    let proxy = zbus::proxy::Builder::<'_, zbus::Proxy<'_>>::new(conn)
+    let proxy = match zbus::proxy::Builder::<'_, zbus::Proxy<'_>>::new(conn)
         .destination("org.bluez").ok()?
         .path(obj_path).ok()?
         .interface(interface).ok()?
         .build()
-        .await.ok()?;
-    let val: zbus::zvariant::OwnedValue = proxy.get_property(property).await.ok()?;
-    T::try_from(val).ok()
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            debug!("Failed to build proxy for {}.{} at {}: {}", interface, property, path, e);
+            return None;
+        }
+    };
+    match proxy.get_property(property).await {
+        Ok(val) => T::try_from(val).ok(),
+        Err(e) => {
+            debug!("Failed to read {}.{} at {}: {}", interface, property, path, e);
+            None
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -113,7 +125,7 @@ fn main() -> io::Result<()> {
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/airpods-tui.log")
+        .open(crate::utils::runtime_dir().join("airpods-tui.log"))
         .expect("Failed to open log file");
     env_logger::Builder::from_default_env()
         .target(env_logger::Target::Pipe(Box::new(log_file)))
@@ -321,7 +333,10 @@ async fn avrcp_volume_monitor(config: config::Config) {
     };
 
     let rule = "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
-    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else { return };
+    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
+        debug!("Failed to create DBusProxy for AVRCP volume monitor");
+        return;
+    };
     if let Err(e) = proxy.add_match_rule(rule.try_into().unwrap()).await {
         log::error!("Failed to add AVRCP match rule: {}", e);
         return;
@@ -401,7 +416,10 @@ async fn bluez_connection_listener(
     config: config::Config,
 ) {
     let rule = "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
-    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else { return };
+    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
+        debug!("Failed to create DBusProxy for BlueZ connection listener");
+        return;
+    };
     if let Err(e) = proxy.add_match_rule(rule.try_into().unwrap()).await {
         log::error!("Failed to add BlueZ match rule: {}", e);
         return;
@@ -458,7 +476,10 @@ async fn bluez_connection_listener(
 
         // Nothing Ear or other managed device
         if managed_devices_mac.contains(&addr_str) {
-            let Some(dev_data) = devices_list.get(&addr_str) else { continue };
+            let Some(dev_data) = devices_list.get(&addr_str) else {
+                debug!("Managed device {} not found in devices_list", addr_str);
+                continue;
+            };
             let type_ = dev_data.type_.clone();
             let device_name = dev_data.name.clone();
             if type_ == devices::enums::DeviceType::Nothing {
@@ -512,7 +533,13 @@ async fn bluez_connection_listener(
         let dm_clone = device_managers.clone();
         let config_clone = config.clone();
         tokio::spawn(async move {
-            let airpods_device = AirPodsDevice::new(addr, app_tx_clone.clone(), product_id, config_clone).await;
+            let airpods_device = match AirPodsDevice::new(addr, app_tx_clone.clone(), product_id, config_clone).await {
+                Ok(dev) => dev,
+                Err(e) => {
+                    log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
+                    return;
+                }
+            };
             let mut managers = dm_clone.write().await;
             let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
             managers
@@ -608,15 +635,21 @@ async fn bluetooth_main(
             let addr_str = addr_str_pre;
             let product_id = read_product_id(&addr_str).await;
             info!("Product ID for {}: 0x{:04x}", addr_str, product_id);
-            let airpods_device = AirPodsDevice::new(device.address(), app_tx.clone(), product_id, config.clone()).await;
-            let mut managers = device_managers.write().await;
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(addr_str.clone())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            let _ = app_tx.send(AppEvent::DeviceConnected { mac: addr_str, name, is_nothing: false, product_id });
+            match AirPodsDevice::new(device.address(), app_tx.clone(), product_id, config.clone()).await {
+                Ok(airpods_device) => {
+                    let mut managers = device_managers.write().await;
+                    let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
+                    managers
+                        .entry(addr_str.clone())
+                        .or_insert(dev_managers)
+                        .set_aacp(airpods_device.aacp_manager);
+                    drop(managers);
+                    let _ = app_tx.send(AppEvent::DeviceConnected { mac: addr_str, name, is_nothing: false, product_id });
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
+                }
+            }
         }
         Err(_) => {
             info!("No connected AirPods found.");
