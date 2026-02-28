@@ -1,0 +1,11 @@
+[Unit]
+Description=AirPods TUI daemon
+After=bluetooth.target
+
+[Service]
+ExecStart=/usr/bin/airpods-tui --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

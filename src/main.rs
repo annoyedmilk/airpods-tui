@@ -46,6 +46,8 @@ struct Args {
     waybar: bool,
     #[arg(long, help = "Print JSON status for waybar on each change (persistent)")]
     waybar_watch: bool,
+    #[arg(long, help = "Run as headless daemon (no TUI, just maintain connections)")]
+    daemon: bool,
 }
 
 /// Read the BlueZ Modalias property for a device and return its Apple product ID (0 if unknown).
@@ -130,6 +132,18 @@ fn main() -> io::Result<()> {
     let dm_clone = device_managers.clone();
     let app_tx_bt = app_tx.clone();
     let bt_config = config.clone();
+
+    if args.daemon {
+        // Headless daemon mode: run bluetooth_main directly, drain events
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app_rx = app_rx;
+        rt.spawn(async move {
+            while app_rx.recv().await.is_some() {}
+        });
+        rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config))
+            .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
+        return Ok(());
+    }
 
     // Spawn bluetooth runtime in a background thread
     std::thread::spawn(move || {

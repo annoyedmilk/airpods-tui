@@ -13,15 +13,61 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 - Device renaming
 - Volume swipe synced to system volume via configurable commands
 - Waybar JSON output (`--waybar` / `--waybar-watch`)
+- Background daemon for auto-connect without TUI
 - Supports 26 Apple/Beats models with per-model capability detection
+
+## Install on Omarchy
+
+### 1. Build and install
+
+```bash
+git clone https://github.com/annoyedmilk/airpods-tui.git
+cd airpods-tui
+cargo build --release
+sudo cp target/release/airpods-tui /usr/bin/airpods-tui
+```
+
+### 2. Enable the background daemon
+
+This keeps AirPods auto-connecting even when the TUI isn't open:
+
+```bash
+cp airpods-tui.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now airpods-tui.service
+```
+
+### 3. Add Waybar module
+
+Add this to `~/.config/waybar/config.jsonc` inside the modules list:
+
+```jsonc
+"custom/airpods": {
+    "exec": "airpods-tui --waybar-watch",
+    "return-type": "json",
+    "format": "󰥰 {}",
+    "on-click": "airpods-tui"
+}
+```
+
+Then add `"custom/airpods"` to your bar's `modules-right` (or wherever you prefer) and restart Waybar:
+
+```bash
+omarchy-restart-waybar
+```
+
+### 4. Pair your AirPods
+
+Open the AirPods case, hold the button on the back until the light flashes white, then pair via Bluetooth settings or `bluetoothctl`.
 
 ## Usage
 
 ```
-airpods-tui              # launch TUI
-airpods-tui --waybar     # print JSON status and exit
+airpods-tui                 # launch TUI
+airpods-tui --daemon        # run as background daemon (no TUI)
+airpods-tui --waybar        # print JSON status and exit
 airpods-tui --waybar-watch  # persistent JSON output on changes
-airpods-tui -d           # enable debug logging (/tmp/airpods-tui.log)
+airpods-tui -d              # enable debug logging (/tmp/airpods-tui.log)
 ```
 
 ## Keys
