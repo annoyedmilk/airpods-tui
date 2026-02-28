@@ -1,8 +1,6 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
-use dbus::arg::RefArg;
-use dbus::blocking::Connection;
-use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+use crate::config::Config;
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::introspect::SinkInfo;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
@@ -13,11 +11,12 @@ use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+// ── PulseAudio thread: single long-lived Mainloop + Context ──
 
 #[derive(Clone)]
 struct OwnedCardProfileInfo {
@@ -38,6 +37,454 @@ struct OwnedSinkInfo {
     volume: ChannelVolumes,
 }
 
+enum AudioCommand {
+    IsA2dpAvailable {
+        card_index: u32,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    GetDeviceIndex {
+        mac: String,
+        reply: tokio::sync::oneshot::Sender<Option<u32>>,
+    },
+    SetCardProfile {
+        card_index: u32,
+        profile: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    GetSinkVolume {
+        sink_name: String,
+        reply: tokio::sync::oneshot::Sender<Option<u32>>,
+    },
+    TransitionVolume {
+        sink_name: String,
+        target: u32,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    GetSinkNameByMac {
+        mac: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    IsProfileAvailable {
+        card_index: u32,
+        profile: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+}
+
+/// Spawn a single background thread that owns the PulseAudio Mainloop + Context.
+/// Returns a sender for issuing commands.
+fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
+    let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
+
+    std::thread::spawn(move || {
+        let mut mainloop = match Mainloop::new() {
+            Some(m) => m,
+            None => {
+                error!("Failed to create PulseAudio mainloop");
+                return;
+            }
+        };
+        let mut context = match Context::new(&mainloop, "airpods-tui") {
+            Some(c) => c,
+            None => {
+                error!("Failed to create PulseAudio context");
+                return;
+            }
+        };
+        if context
+            .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
+            .is_err()
+        {
+            error!("Failed to connect PulseAudio context");
+            return;
+        }
+
+        // Wait for Ready state
+        loop {
+            match mainloop.iterate(true) {
+                _ if context.get_state() == libpulse_binding::context::State::Ready => break,
+                _ if context.get_state() == libpulse_binding::context::State::Failed
+                    || context.get_state() == libpulse_binding::context::State::Terminated =>
+                {
+                    error!("PulseAudio context failed during connect");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        info!("PulseAudio audio thread connected and ready");
+
+        // Process commands
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                AudioCommand::IsA2dpAvailable { card_index, reply } => {
+                    let result = pa_is_a2dp_available(&mut mainloop, &context, card_index);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::GetDeviceIndex { mac, reply } => {
+                    let result = pa_get_device_index(&mut mainloop, &context, &mac);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::SetCardProfile {
+                    card_index,
+                    profile,
+                    reply,
+                } => {
+                    let result =
+                        pa_set_card_profile(&mut mainloop, &mut context, card_index, &profile);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::GetSinkVolume { sink_name, reply } => {
+                    let result = pa_get_sink_volume(&mut mainloop, &context, &sink_name);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::TransitionVolume {
+                    sink_name,
+                    target,
+                    reply,
+                } => {
+                    let result =
+                        pa_transition_volume(&mut mainloop, &mut context, &sink_name, target);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::GetSinkNameByMac { mac, reply } => {
+                    let result = pa_get_sink_name_by_mac(&mut mainloop, &context, &mac);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::IsProfileAvailable {
+                    card_index,
+                    profile,
+                    reply,
+                } => {
+                    let result =
+                        pa_is_profile_available(&mut mainloop, &context, card_index, &profile);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+
+        mainloop.quit(Retval(0));
+        info!("PulseAudio audio thread exiting");
+    });
+
+    tx
+}
+
+// ── Synchronous PA helpers (run inside the audio thread) ──
+
+fn pa_get_card_info_list(mainloop: &mut Mainloop, context: &Context) -> Vec<OwnedCardInfo> {
+    let introspector = context.introspect();
+    let card_info_list = Rc::new(RefCell::new(None));
+    let op = introspector.get_card_info_list({
+        let card_info_list = card_info_list.clone();
+        let mut list = Vec::new();
+        move |result| match result {
+            ListResult::Item(item) => {
+                let profiles = item
+                    .profiles
+                    .iter()
+                    .map(|p| OwnedCardProfileInfo {
+                        name: p.name.as_ref().map(|n| n.to_string()),
+                    })
+                    .collect();
+                list.push(OwnedCardInfo {
+                    index: item.index,
+                    proplist: item.proplist.clone(),
+                    profiles,
+                });
+            }
+            ListResult::End => *card_info_list.borrow_mut() = Some(list.clone()),
+            ListResult::Error => *card_info_list.borrow_mut() = None,
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    card_info_list.borrow().clone().unwrap_or_default()
+}
+
+fn pa_is_a2dp_available(mainloop: &mut Mainloop, context: &Context, card_index: u32) -> bool {
+    let cards = pa_get_card_info_list(mainloop, context);
+    cards
+        .iter()
+        .find(|c| c.index == card_index)
+        .map(|card| {
+            card.profiles
+                .iter()
+                .any(|p| p.name.as_ref().is_some_and(|n| n.starts_with("a2dp-sink")))
+        })
+        .unwrap_or(false)
+}
+
+fn pa_get_device_index(mainloop: &mut Mainloop, context: &Context, mac: &str) -> Option<u32> {
+    let cards = pa_get_card_info_list(mainloop, context);
+    for card in &cards {
+        if let Some(device_string) = card.proplist.get_str("device.string") {
+            if device_string.contains(mac) {
+                return Some(card.index);
+            }
+        }
+    }
+    None
+}
+
+fn pa_set_card_profile(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    card_index: u32,
+    profile: &str,
+) -> bool {
+    let mut introspector = context.introspect();
+    let op = introspector.set_card_profile_by_index(card_index, profile, None);
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    true
+}
+
+fn pa_get_sink_volume(mainloop: &mut Mainloop, context: &Context, sink_name: &str) -> Option<u32> {
+    let introspector = context.introspect();
+    let sink_info_option = Rc::new(RefCell::new(None));
+    let op = introspector.get_sink_info_by_name(sink_name, {
+        let sink_info_option = sink_info_option.clone();
+        move |result: ListResult<&SinkInfo>| {
+            if let ListResult::Item(item) = result {
+                let owned_item = OwnedSinkInfo {
+                    name: item.name.as_ref().map(|s| s.to_string()),
+                    proplist: item.proplist.clone(),
+                    volume: item.volume,
+                };
+                *sink_info_option.borrow_mut() = Some(owned_item);
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
+        let channels = sink_info.volume.len();
+        if channels == 0 {
+            return None;
+        }
+        let total: f64 = sink_info.volume.get().iter().map(|v| v.0 as f64).sum();
+        let average_raw = total / channels as f64;
+        let percent = ((average_raw / Volume::NORMAL.0 as f64) * 100.0).round() as u32;
+        Some(percent)
+    } else {
+        None
+    }
+}
+
+fn pa_transition_volume(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    sink_name: &str,
+    target_volume: u32,
+) -> bool {
+    let introspector = context.introspect();
+    let sink_info_option = Rc::new(RefCell::new(None));
+    let op = introspector.get_sink_info_by_name(sink_name, {
+        let sink_info_option = sink_info_option.clone();
+        move |result: ListResult<&SinkInfo>| {
+            if let ListResult::Item(item) = result {
+                let owned_item = OwnedSinkInfo {
+                    name: item.name.as_ref().map(|s| s.to_string()),
+                    proplist: item.proplist.clone(),
+                    volume: item.volume,
+                };
+                *sink_info_option.borrow_mut() = Some(owned_item);
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
+        let channels = sink_info.volume.len();
+        let mut new_volumes = ChannelVolumes::default();
+        let raw =
+            (((target_volume as f64) / 100.0) * (Volume::NORMAL.0 as f64)).round() as u32;
+        let vol = Volume(raw);
+        new_volumes.set(channels, vol);
+
+        let mut introspector = context.introspect();
+        let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
+        while op.get_state() == OperationState::Running {
+            mainloop.iterate(false);
+        }
+        true
+    } else {
+        error!("Sink not found: {}", sink_name);
+        false
+    }
+}
+
+fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str) -> Option<String> {
+    let introspector = context.introspect();
+    let sink_info_list = Rc::new(RefCell::new(Some(Vec::new())));
+    let op = introspector.get_sink_info_list({
+        let sink_info_list = sink_info_list.clone();
+        move |result: ListResult<&SinkInfo>| {
+            if let ListResult::Item(item) = result {
+                let owned_item = OwnedSinkInfo {
+                    name: item.name.as_ref().map(|s| s.to_string()),
+                    proplist: item.proplist.clone(),
+                    volume: item.volume,
+                };
+                sink_info_list
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .push(owned_item);
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+
+    if let Some(list) = sink_info_list.borrow().as_ref() {
+        for sink in list {
+            if let Some(device_string) = sink.proplist.get_str("device.string") {
+                if device_string
+                    .to_uppercase()
+                    .contains(&mac.to_uppercase())
+                {
+                    if let Some(name) = &sink.name {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
+                let mac_from_path = bluez_path
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("")
+                    .replace("dev_", "")
+                    .replace('_', ":");
+                if mac_from_path.eq_ignore_ascii_case(mac) {
+                    if let Some(name) = &sink.name {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn pa_is_profile_available(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    card_index: u32,
+    profile: &str,
+) -> bool {
+    let cards = pa_get_card_info_list(mainloop, context);
+    cards
+        .iter()
+        .find(|c| c.index == card_index)
+        .map(|card| {
+            card.profiles
+                .iter()
+                .any(|p| p.name.as_ref() == Some(&profile.to_string()))
+        })
+        .unwrap_or(false)
+}
+
+// ── Async wrappers: send command + await oneshot reply ──
+
+async fn audio_cmd_is_a2dp(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    card_index: u32,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::IsA2dpAvailable {
+        card_index,
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_get_device_index(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    mac: &str,
+) -> Option<u32> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::GetDeviceIndex {
+        mac: mac.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(None)
+}
+
+async fn audio_cmd_set_card_profile(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    card_index: u32,
+    profile: &str,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::SetCardProfile {
+        card_index,
+        profile: profile.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_get_sink_volume(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+) -> Option<u32> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::GetSinkVolume {
+        sink_name: sink_name.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(None)
+}
+
+async fn audio_cmd_transition_volume(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+    target: u32,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::TransitionVolume {
+        sink_name: sink_name.to_string(),
+        target,
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_get_sink_name_by_mac(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    mac: &str,
+) -> Option<String> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::GetSinkNameByMac {
+        mac: mac.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(None)
+}
+
+async fn audio_cmd_is_profile_available(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    card_index: u32,
+    profile: &str,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::IsProfileAvailable {
+        card_index,
+        profile: profile.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+// ── MediaController ──
+
 struct MediaControllerState {
     connected_device_mac: String,
     local_mac: String,
@@ -53,10 +500,13 @@ struct MediaControllerState {
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
+    config: Config,
+    audio_tx: std::sync::mpsc::Sender<AudioCommand>,
 }
 
 impl MediaControllerState {
-    fn new() -> Self {
+    fn new(config: Config) -> Self {
+        let audio_tx = spawn_audio_thread();
         MediaControllerState {
             connected_device_mac: String::new(),
             local_mac: String::new(),
@@ -72,6 +522,8 @@ impl MediaControllerState {
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
+            config,
+            audio_tx,
         }
     }
 }
@@ -82,8 +534,8 @@ pub struct MediaController {
 }
 
 impl MediaController {
-    pub fn new(connected_mac: String, local_mac: String) -> Self {
-        let mut state = MediaControllerState::new();
+    pub fn new(connected_mac: String, local_mac: String, config: Config) -> Self {
+        let mut state = MediaControllerState::new(config);
         state.connected_device_mac = connected_mac;
         state.local_mac = local_mac;
         MediaController {
@@ -127,9 +579,7 @@ impl MediaController {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let is_playing = tokio::task::spawn_blocking(|| Self::check_if_playing())
-                .await
-                .unwrap_or(false);
+            let is_playing = Self::check_if_playing_async().await;
 
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
@@ -181,38 +631,30 @@ impl MediaController {
         }
     }
 
-    fn check_if_playing() -> bool {
-        let conn = match Connection::new_session() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+    async fn check_if_playing_async() -> bool {
+        let Ok(conn) = zbus::Connection::session().await else { return false };
+        let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else { return false };
+        let Ok(names) = proxy.list_names().await else { return false };
 
-        let proxy = conn.with_proxy(
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            Duration::from_secs(5),
-        );
-        let (names,): (Vec<String>,) =
-            match proxy.method_call("org.freedesktop.DBus", "ListNames", ()) {
-                Ok(n) => n,
-                Err(_) => return false,
-            };
-
-        for service in names {
+        for name in names {
+            let service = name.as_str();
             if !service.starts_with("org.mpris.MediaPlayer2.") {
                 continue;
             }
-            if Self::is_kdeconnect_service(&service) {
+            if Self::is_kdeconnect_service(service) {
                 continue;
             }
-
-            let proxy =
-                conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-            if let Ok(playback_status) =
-                proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                && playback_status == "Playing"
-            {
-                return true;
+            if let Ok(p) = zbus::Proxy::new(
+                &conn,
+                service,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            ).await {
+                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
+                    if status == "Playing" {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -345,13 +787,14 @@ impl MediaController {
 
         let device_index = state.device_index;
         let mac = state.connected_device_mac.clone();
+        let audio_tx = state.audio_tx.clone();
         drop(state);
 
         let mut current_device_index = device_index;
 
         if current_device_index.is_none() {
             warn!("Device index not found, trying to get it.");
-            current_device_index = self.get_audio_device_index(&mac).await;
+            current_device_index = audio_cmd_get_device_index(&audio_tx, &mac).await;
             if let Some(idx) = current_device_index {
                 let mut state = self.state.lock().await;
                 state.device_index = Some(idx);
@@ -361,23 +804,27 @@ impl MediaController {
             }
         }
 
-        if !self.is_a2dp_profile_available().await {
-            warn!("A2DP profile not available, attempting to restart WirePlumber");
+        let idx = current_device_index.unwrap();
+
+        if !audio_cmd_is_a2dp(&audio_tx, idx).await {
+            warn!("A2DP profile not available, attempting to restart audio server");
             if self.restart_wire_plumber().await {
                 let mut state = self.state.lock().await;
-                state.device_index = self
-                    .get_audio_device_index(&state.connected_device_mac)
-                    .await;
-                debug!(
-                    "Updated device_index after WirePlumber restart: {:?}",
-                    state.device_index
-                );
-                if !self.is_a2dp_profile_available().await {
-                    error!("A2DP profile still not available after WirePlumber restart");
+                state.device_index = audio_cmd_get_device_index(&state.audio_tx, &state.connected_device_mac).await;
+                let new_idx = state.device_index;
+                let audio_tx = state.audio_tx.clone();
+                drop(state);
+                if let Some(new_idx) = new_idx {
+                    if !audio_cmd_is_a2dp(&audio_tx, new_idx).await {
+                        error!("A2DP profile still not available after audio server restart");
+                        return;
+                    }
+                } else {
+                    error!("Could not get device index after audio server restart");
                     return;
                 }
             } else {
-                error!("Could not restart WirePlumber, A2DP profile unavailable");
+                error!("Could not restart audio server, A2DP profile unavailable");
                 return;
             }
         }
@@ -391,16 +838,14 @@ impl MediaController {
         info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         let state = self.state.lock().await;
         let device_index = state.device_index;
+        let audio_tx = state.audio_tx.clone();
         drop(state);
 
         if let Some(idx) = device_index {
-            let profile_name = preferred_profile.clone();
-            let success =
-                tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile_name))
-                    .await
-                    .unwrap_or(false);
-
-            if success {
+            let success = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {})).is_ok();
+            let _ = success; // unused, just keeping structure
+            let ok = audio_cmd_set_card_profile(&audio_tx, idx, &preferred_profile).await;
+            if ok {
                 info!("Successfully activated A2DP profile: {}", preferred_profile);
             } else {
                 warn!("Failed to activate A2DP profile: {}", preferred_profile);
@@ -413,197 +858,102 @@ impl MediaController {
     async fn pause(&self) {
         debug!("Pausing playback");
 
-        let paused_services = tokio::task::spawn_blocking(|| {
-            debug!("Listing DBus names for media players");
-            let conn = Connection::new_session().unwrap();
-            let proxy = conn.with_proxy(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                Duration::from_secs(5),
-            );
-            let (names,): (Vec<String>,) = proxy
-                .method_call("org.freedesktop.DBus", "ListNames", ())
-                .unwrap();
-            let mut paused_services = Vec::new();
+        let Ok(conn) = zbus::Connection::session().await else {
+            error!("Failed to connect to session D-Bus for pause");
+            return;
+        };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
+        let Ok(names) = dbus.list_names().await else { return };
+        let mut paused_services = Vec::new();
 
-            for service in names {
-                if !service.starts_with("org.mpris.MediaPlayer2.") {
-                    continue;
-                }
-                if Self::is_kdeconnect_service(&service) {
-                    debug!("Skipping kdeconnect service: {}", service);
-                    continue;
-                }
-
-                debug!("Checking playback status for service: {}", service);
-                let proxy =
-                    conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if let Ok(playback_status) =
-                    proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                    && playback_status == "Playing"
-                {
-                    debug!("Service {} is playing, attempting to pause", service);
-                    if proxy
-                        .method_call::<(), _, &str, &str>(
-                            "org.mpris.MediaPlayer2.Player",
-                            "Pause",
-                            (),
-                        )
-                        .is_ok()
-                    {
-                        info!("Paused playback for: {}", service);
-                        paused_services.push(service);
-                    } else {
-                        debug!("Failed to pause service: {}", service);
-                        error!("Failed to pause {}", service);
+        for name in names {
+            let service = name.as_str();
+            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+                continue;
+            }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
+                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
+                    if status == "Playing" {
+                        if p.call_noreply("Pause", &()).await.is_ok() {
+                            info!("Paused playback for: {}", service);
+                            paused_services.push(service.to_string());
+                        } else {
+                            error!("Failed to pause {}", service);
+                        }
                     }
                 }
             }
-            paused_services
-        })
-        .await
-        .unwrap();
+        }
 
         if !paused_services.is_empty() {
-            debug!("Paused services: {:?}", paused_services);
             info!("Paused {} media player(s) via DBus", paused_services.len());
             let mut state = self.state.lock().await;
             state.paused_by_app_services = paused_services;
             state.is_playing = false;
         } else {
-            debug!("No playing media players found");
             info!("No playing media players found to pause");
+        }
+    }
+
+    async fn mpris_call_first(&self, method: &str) {
+        let Ok(conn) = zbus::Connection::session().await else { return };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
+        let Ok(names) = dbus.list_names().await else { return };
+        for name in names {
+            let service = name.as_str();
+            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+                continue;
+            }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
+                if p.call_noreply(method, &()).await.is_ok() {
+                    info!("{} for: {}", method, service);
+                    break;
+                }
+            }
         }
     }
 
     pub async fn toggle_play_pause(&self) {
         debug!("Toggling play/pause via MPRIS");
-        tokio::task::spawn_blocking(|| {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(e) => { error!("D-Bus session error: {}", e); return; }
-            };
-            let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(5));
-            let (names,): (Vec<String>,) = match proxy.method_call("org.freedesktop.DBus", "ListNames", ()) {
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            for service in names {
-                if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(&service) {
-                    continue;
-                }
-                let p = conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if p.method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "PlayPause", ()).is_ok() {
-                    info!("Toggled play/pause for: {}", service);
-                    break; // only toggle the first active player
-                }
-            }
-        }).await.ok();
+        self.mpris_call_first("PlayPause").await;
     }
 
     pub async fn next_track(&self) {
         debug!("Next track via MPRIS");
-        tokio::task::spawn_blocking(|| {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(e) => { error!("D-Bus session error: {}", e); return; }
-            };
-            let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(5));
-            let (names,): (Vec<String>,) = match proxy.method_call("org.freedesktop.DBus", "ListNames", ()) {
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            for service in names {
-                if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(&service) {
-                    continue;
-                }
-                let p = conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if p.method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Next", ()).is_ok() {
-                    info!("Next track for: {}", service);
-                    break;
-                }
-            }
-        }).await.ok();
+        self.mpris_call_first("Next").await;
     }
 
     pub async fn previous_track(&self) {
         debug!("Previous track via MPRIS");
-        tokio::task::spawn_blocking(|| {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(e) => { error!("D-Bus session error: {}", e); return; }
-            };
-            let proxy = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(5));
-            let (names,): (Vec<String>,) = match proxy.method_call("org.freedesktop.DBus", "ListNames", ()) {
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            for service in names {
-                if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(&service) {
-                    continue;
-                }
-                let p = conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if p.method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Previous", ()).is_ok() {
-                    info!("Previous track for: {}", service);
-                    break;
-                }
-            }
-        }).await.ok();
+        self.mpris_call_first("Previous").await;
     }
 
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
 
-        let paused_count = tokio::task::spawn_blocking(|| {
-            debug!("Listing DBus names for media players");
-            let conn = Connection::new_session().unwrap();
-            let proxy = conn.with_proxy(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                Duration::from_secs(5),
-            );
-            let (names,): (Vec<String>,) = proxy
-                .method_call("org.freedesktop.DBus", "ListNames", ())
-                .unwrap();
-            let mut paused_count = 0;
+        let Ok(conn) = zbus::Connection::session().await else { return };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
+        let Ok(names) = dbus.list_names().await else { return };
+        let mut paused_count = 0;
 
-            for service in names {
-                if !service.starts_with("org.mpris.MediaPlayer2.") {
-                    continue;
-                }
-                if Self::is_kdeconnect_service(&service) {
-                    debug!("Skipping kdeconnect service: {}", service);
-                    continue;
-                }
-
-                debug!("Checking playback status for service: {}", service);
-                let proxy =
-                    conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if let Ok(playback_status) =
-                    proxy.get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                    && playback_status == "Playing"
-                {
-                    debug!("Service {} is playing, attempting to pause", service);
-                    if proxy
-                        .method_call::<(), _, &str, &str>(
-                            "org.mpris.MediaPlayer2.Player",
-                            "Pause",
-                            (),
-                        )
-                        .is_ok()
-                    {
-                        info!("Paused playback for: {}", service);
-                        paused_count += 1;
-                    } else {
-                        debug!("Failed to pause service: {}", service);
-                        error!("Failed to pause {}", service);
+        for name in names {
+            let service = name.as_str();
+            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+                continue;
+            }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
+                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
+                    if status == "Playing" {
+                        if p.call_noreply("Pause", &()).await.is_ok() {
+                            info!("Paused playback for: {}", service);
+                            paused_count += 1;
+                        } else {
+                            error!("Failed to pause {}", service);
+                        }
                     }
                 }
             }
-            paused_count
-        })
-        .await
-        .unwrap();
+        }
 
         if paused_count > 0 {
             info!(
@@ -612,350 +962,105 @@ impl MediaController {
             );
             let mut state = self.state.lock().await;
             state.is_playing = false;
-        } else {
-            debug!("No playing media players found to pause");
         }
     }
 
     async fn resume(&self) {
-        debug!("Entering resume method");
         debug!("Resuming playback");
         let state = self.state.lock().await;
         let services = state.paused_by_app_services.clone();
         drop(state);
 
         if services.is_empty() {
-            debug!("No services to resume");
             info!("No services to resume");
             return;
         }
 
-        let resumed_count = tokio::task::spawn_blocking(move || {
-            let conn = Connection::new_session().unwrap();
-            let mut resumed_count = 0;
-            for service in services {
-                if Self::is_kdeconnect_service(&service) {
-                    debug!("Skipping kdeconnect service: {}", service);
-                    continue;
-                }
-
-                debug!("Attempting to resume service: {}", service);
-                let proxy =
-                    conn.with_proxy(&service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-                if proxy
-                    .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Play", ())
-                    .is_ok()
-                {
+        let Ok(conn) = zbus::Connection::session().await else { return };
+        let mut resumed_count = 0;
+        for service in &services {
+            if Self::is_kdeconnect_service(service) {
+                continue;
+            }
+            if let Ok(p) = zbus::Proxy::new(&conn, service.as_str(), "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
+                if p.call_noreply("Play", &()).await.is_ok() {
                     info!("Resumed playback for: {}", service);
                     resumed_count += 1;
                 } else {
-                    debug!("Failed to resume service: {}", service);
                     warn!("Failed to resume {}", service);
                 }
             }
-            resumed_count
-        })
-        .await
-        .unwrap();
+        }
 
         if resumed_count > 0 {
-            debug!("Resumed {} services", resumed_count);
             info!("Resumed {} media player(s) via DBus", resumed_count);
             let mut state = self.state.lock().await;
             state.paused_by_app_services.clear();
         } else {
-            debug!("Failed to resume any services");
             error!("Failed to resume any media players via DBus");
         }
     }
 
-    async fn is_a2dp_profile_available(&self) -> bool {
-        debug!("Entering is_a2dp_profile_available");
-        let state = self.state.lock().await;
-        let device_index = state.device_index;
-        drop(state);
-
-        let index = match device_index {
-            Some(i) => i,
-            None => {
-                debug!("Device index is None, returning false");
-                return false;
-            }
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let mut mainloop = Mainloop::new().unwrap();
-            let mut context =
-                Context::new(&mainloop, "LibrePods-is_a2dp_profile_available").unwrap();
-            context
-                .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-                .unwrap();
-            loop {
-                match mainloop.iterate(false) {
-                    _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-                    _ if context.get_state() == libpulse_binding::context::State::Failed
-                        || context.get_state() == libpulse_binding::context::State::Terminated =>
-                    {
-                        return false;
-                    }
-                    _ => {}
-                }
-            }
-
-            let introspector = context.introspect();
-            let card_info_list = Rc::new(RefCell::new(None));
-            let op = introspector.get_card_info_list({
-                let card_info_list = card_info_list.clone();
-                let mut list = Vec::new();
-                move |result| match result {
-                    ListResult::Item(item) => {
-                        let profiles = item
-                            .profiles
-                            .iter()
-                            .map(|p| OwnedCardProfileInfo {
-                                name: p.name.as_ref().map(|n| n.to_string()),
-                            })
-                            .collect();
-                        list.push(OwnedCardInfo {
-                            index: item.index,
-                            proplist: item.proplist.clone(),
-                            profiles,
-                        });
-                    }
-                    ListResult::End => *card_info_list.borrow_mut() = Some(list.clone()),
-                    ListResult::Error => *card_info_list.borrow_mut() = None,
-                }
-            });
-
-            while op.get_state() == OperationState::Running {
-                mainloop.iterate(false);
-            }
-            mainloop.quit(Retval(0));
-
-            if let Some(list) = card_info_list.borrow().as_ref()
-                && let Some(card) = list.iter().find(|c| c.index == index)
-            {
-                let available = card.profiles.iter().any(|p| {
-                    p.name
-                        .as_ref()
-                        .is_some_and(|name| name.starts_with("a2dp-sink"))
-                });
-                debug!("A2DP profile available: {}", available);
-                return available;
-            }
-            debug!("A2DP profile not available");
-            false
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     async fn get_preferred_a2dp_profile(&self) -> String {
-        debug!("Entering get_preferred_a2dp_profile");
         let state = self.state.lock().await;
         let device_index = state.device_index;
         let cached_profile = state.cached_a2dp_profile.clone();
+        let audio_tx = state.audio_tx.clone();
         drop(state);
 
         let index = match device_index {
             Some(i) => i,
-            None => {
-                debug!("Device index is None, returning empty string");
-                return String::new();
-            }
+            None => return String::new(),
         };
 
-        if !cached_profile.is_empty() && self.is_profile_available(index, &cached_profile).await {
-            debug!("Using cached A2DP profile: {}", cached_profile);
+        if !cached_profile.is_empty()
+            && audio_cmd_is_profile_available(&audio_tx, index, &cached_profile).await
+        {
             return cached_profile;
         }
 
-        let profiles_to_check = vec!["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"];
+        let profiles_to_check = ["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"];
         for profile in profiles_to_check {
-            debug!("Checking availability of profile: {}", profile);
-            if self.is_profile_available(index, profile).await {
-                debug!("Selected profile: {}", profile);
+            if audio_cmd_is_profile_available(&audio_tx, index, profile).await {
                 info!("Selected best available A2DP profile: {}", profile);
                 let mut state = self.state.lock().await;
                 state.cached_a2dp_profile = profile.to_string();
                 return profile.to_string();
             }
         }
-        debug!("No suitable profile found");
         String::new()
-    }
-
-    async fn is_profile_available(&self, card_index: u32, profile: &str) -> bool {
-        debug!(
-            "Entering is_profile_available for card index: {}, profile: {}",
-            card_index, profile
-        );
-        let profile_name = profile.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut mainloop = Mainloop::new().unwrap();
-            let mut context = Context::new(&mainloop, "LibrePods-is_profile_available").unwrap();
-            context
-                .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-                .unwrap();
-            loop {
-                match mainloop.iterate(false) {
-                    _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-                    _ if context.get_state() == libpulse_binding::context::State::Failed
-                        || context.get_state() == libpulse_binding::context::State::Terminated =>
-                    {
-                        return false;
-                    }
-                    _ => {}
-                }
-            }
-
-            let introspector = context.introspect();
-            let card_info_list = Rc::new(RefCell::new(None));
-            let op = introspector.get_card_info_list({
-                let card_info_list = card_info_list.clone();
-                let mut list = Vec::new();
-                move |result| match result {
-                    ListResult::Item(item) => {
-                        let profiles = item
-                            .profiles
-                            .iter()
-                            .map(|p| OwnedCardProfileInfo {
-                                name: p.name.as_ref().map(|n| n.to_string()),
-                            })
-                            .collect();
-                        list.push(OwnedCardInfo {
-                            index: item.index,
-                            proplist: item.proplist.clone(),
-                            profiles,
-                        });
-                    }
-                    ListResult::End => *card_info_list.borrow_mut() = Some(list.clone()),
-                    ListResult::Error => *card_info_list.borrow_mut() = None,
-                }
-            });
-
-            while op.get_state() == OperationState::Running {
-                mainloop.iterate(false);
-            }
-            mainloop.quit(Retval(0));
-
-            if let Some(list) = card_info_list.borrow().as_ref()
-                && let Some(card) = list.iter().find(|c| c.index == card_index)
-            {
-                let available = card
-                    .profiles
-                    .iter()
-                    .any(|p| p.name.as_ref() == Some(&profile_name));
-                debug!("Profile {} available: {}", profile_name, available);
-                return available;
-            }
-            debug!("Profile {} not available", profile_name);
-            false
-        })
-        .await
-        .unwrap_or(false)
     }
 
     async fn restart_wire_plumber(&self) -> bool {
         debug!("Entering restart_wire_plumber");
-        info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
-            .args(["--user", "restart", "wireplumber"])
+        let state = self.state.lock().await;
+        let cmd = state.config.restart_audio_server.clone();
+        drop(state);
+
+        let Some(cmd) = cmd else {
+            info!("No restart_audio_server configured, skipping audio server restart");
+            return false;
+        };
+        if cmd.is_empty() {
+            return false;
+        }
+
+        info!("Restarting audio server: {:?}", cmd);
+        let result = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
             .output();
 
         match result {
             Ok(output) if output.status.success() => {
-                info!("WirePlumber restarted successfully");
+                info!("Audio server restarted successfully");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 true
             }
             _ => {
-                error!("Failed to restart WirePlumber. Do you use wireplumber?");
+                error!("Failed to restart audio server via {:?}", cmd);
                 false
             }
         }
-    }
-
-    async fn get_audio_device_index(&self, mac: &str) -> Option<u32> {
-        debug!("Entering get_audio_device_index for MAC: {}", mac);
-        if mac.is_empty() {
-            debug!("MAC is empty, returning None");
-            return None;
-        }
-        let mac_clone = mac.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let mut mainloop = Mainloop::new().unwrap();
-            let mut context = Context::new(&mainloop, "LibrePods-get_audio_device_index").unwrap();
-            context
-                .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-                .unwrap();
-
-            loop {
-                match mainloop.iterate(false) {
-                    _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-                    _ if context.get_state() == libpulse_binding::context::State::Failed
-                        || context.get_state() == libpulse_binding::context::State::Terminated =>
-                    {
-                        return None;
-                    }
-                    _ => {}
-                }
-            }
-
-            let introspector = context.introspect();
-            let card_info_list = Rc::new(RefCell::new(None));
-            let op = introspector.get_card_info_list({
-                let card_info_list = card_info_list.clone();
-                let mut list = Vec::new();
-                move |result| match result {
-                    ListResult::Item(item) => {
-                        let profiles = item
-                            .profiles
-                            .iter()
-                            .map(|p| OwnedCardProfileInfo {
-                                name: p.name.as_ref().map(|n| n.to_string()),
-                            })
-                            .collect();
-                        list.push(OwnedCardInfo {
-                            index: item.index,
-                            proplist: item.proplist.clone(),
-                            profiles,
-                        });
-                    }
-                    ListResult::End => *card_info_list.borrow_mut() = Some(list.clone()),
-                    ListResult::Error => *card_info_list.borrow_mut() = None,
-                }
-            });
-
-            while op.get_state() == OperationState::Running {
-                mainloop.iterate(false);
-            }
-            mainloop.quit(Retval(0));
-
-            if let Some(list) = card_info_list.borrow().as_ref() {
-                for card in list {
-                    debug!("Checking card index {} for MAC match", card.index);
-                    let props = &card.proplist;
-                    if let Some(device_string) = props.get_str("device.string")
-                        && device_string.contains(&mac_clone)
-                    {
-                        info!(
-                            "Found audio device index for MAC {}: {}",
-                            mac_clone, card.index
-                        );
-                        return Some(card.index);
-                    }
-                }
-            }
-            error!(
-                "No matching Bluetooth card found for MAC address: {}",
-                mac_clone
-            );
-            None
-        })
-        .await
-        .unwrap_or(None)
     }
 
     pub async fn deactivate_a2dp_profile(&self) {
@@ -963,9 +1068,9 @@ impl MediaController {
         let mut state = self.state.lock().await;
 
         if state.device_index.is_none() {
-            state.device_index = self
-                .get_audio_device_index(&state.connected_device_mac)
-                .await;
+            let mac = state.connected_device_mac.clone();
+            let audio_tx = state.audio_tx.clone();
+            state.device_index = audio_cmd_get_device_index(&audio_tx, &mac).await;
         }
 
         if state.connected_device_mac.is_empty() || state.device_index.is_none() {
@@ -973,24 +1078,12 @@ impl MediaController {
             return;
         }
         let device_index = state.device_index.unwrap();
+        let audio_tx = state.audio_tx.clone();
         drop(state);
 
         info!("Deactivating A2DP profile for AirPods by setting to off");
-
-        // Use catch_unwind to prevent panics in libpulse-binding from crashing the app
-        let success =
-            tokio::task::spawn_blocking(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    set_card_profile_sync(device_index, "off")
-                })).unwrap_or_else(|e| {
-                    warn!("Panic in set_card_profile_sync: {:?}", e);
-                    false
-                })
-            })
-                .await
-                .unwrap_or(false);
-
-        if success {
+        let ok = audio_cmd_set_card_profile(&audio_tx, device_index, "off").await;
+        if ok {
             info!("Successfully deactivated A2DP profile");
         } else {
             warn!("Failed to deactivate A2DP profile");
@@ -1003,17 +1096,16 @@ impl MediaController {
             status
         );
 
-        let mac;
-        {
+        let (mac, audio_tx) = {
             let state = self.state.lock().await;
-            mac = state.connected_device_mac.clone();
-        }
+            (state.connected_device_mac.clone(), state.audio_tx.clone())
+        };
         if mac.is_empty() {
             debug!("No connected device MAC, skipping conversational awareness");
             return;
         }
 
-        let sink_name = get_sink_name_by_mac(&mac).await;
+        let sink_name = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await;
         let sink = match sink_name {
             Some(s) => s,
             None => {
@@ -1025,12 +1117,7 @@ impl MediaController {
             }
         };
 
-        let current_volume_opt = tokio::task::spawn_blocking({
-            let sink = sink.clone();
-            move || get_sink_volume_percent_by_name_sync(&sink)
-        })
-        .await
-        .unwrap_or(None);
+        let current_volume_opt = audio_cmd_get_sink_volume(&audio_tx, &sink).await;
 
         match status {
             1 => {
@@ -1041,23 +1128,14 @@ impl MediaController {
                     if !state.conv_conversation_started {
                         state.conv_original_volume = Some(original);
                         state.conv_conversation_started = true;
-                    } else {
-                        debug!(
-                            "Conversation already started; not overwriting conv_original_volume"
-                        );
                     }
                 }
                 if original > 25 {
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, 25))
-                        .await
-                        .unwrap_or(false);
+                    audio_cmd_transition_volume(&audio_tx, &sink, 25).await;
                     info!(
                         "Conversation start: lowered volume to 25% (original {})",
                         original
                     );
-                } else {
-                    debug!("Original volume {} <= 25, not reducing to 25", original);
                 }
             }
             2 => {
@@ -1066,23 +1144,13 @@ impl MediaController {
                     state.conv_original_volume
                 };
                 if let Some(orig) = original {
-                    debug!("Conversation reduce (2). Original: {}", orig);
                     if orig > 15 {
-                        let sink_clone = sink.clone();
-                        tokio::task::spawn_blocking(move || {
-                            transition_sink_volume(&sink_clone, 15)
-                        })
-                        .await
-                        .unwrap_or(false);
+                        audio_cmd_transition_volume(&audio_tx, &sink, 15).await;
                         info!(
                             "Conversation reduce: lowered volume to 15% (original {})",
                             orig
                         );
-                    } else {
-                        debug!("Original {} <= 15, not reducing to 15", orig);
                     }
-                } else {
-                    debug!("No original volume known for status 2, skipping");
                 }
             }
             3 => {
@@ -1091,17 +1159,11 @@ impl MediaController {
                     (state.conv_conversation_started, state.conv_original_volume)
                 };
                 if !maybe_orig.0 {
-                    debug!("Received status 3 but conversation was not started; ignoring increase");
                     return;
                 }
                 if let Some(orig) = maybe_orig.1 {
                     let target = if orig > 25 { 25 } else { orig };
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || {
-                        transition_sink_volume(&sink_clone, target)
-                    })
-                    .await
-                    .unwrap_or(false);
+                    audio_cmd_transition_volume(&audio_tx, &sink, target).await;
                     info!(
                         "Conversation partial increase (3): set volume to {} (original {})",
                         target, orig
@@ -1112,21 +1174,11 @@ impl MediaController {
                     } else {
                         orig_from_current
                     };
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || {
-                        transition_sink_volume(&sink_clone, target)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    info!(
-                        "Conversation partial increase (3) with fallback current: set volume to {} (measured {})",
-                        target, orig_from_current
-                    );
-                } else {
-                    debug!("No original volume known for status 3, skipping");
+                    audio_cmd_transition_volume(&audio_tx, &sink, target).await;
                 }
             }
-            4 => {
+            4 | 6 | 7 => {
+                #[allow(unused_assignments)]
                 let mut maybe_original = None;
                 {
                     let mut state = self.state.lock().await;
@@ -1136,69 +1188,15 @@ impl MediaController {
                         state.conv_conversation_started = false;
                     } else {
                         debug!(
-                            "Received status 4 but conversation was not started; ignoring restore"
+                            "Received status {} but conversation was not started; ignoring restore",
+                            status
                         );
                         return;
                     }
                 }
                 if let Some(orig) = maybe_original {
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, orig))
-                        .await
-                        .unwrap_or(false);
-                    info!("Conversation end (4): restored volume to original {}", orig);
-                } else {
-                    debug!("No stored original volume to restore to on status 4");
-                }
-            }
-            6 => {
-                let mut maybe_original = None;
-                {
-                    let mut state = self.state.lock().await;
-                    if state.conv_conversation_started {
-                        maybe_original = state.conv_original_volume;
-                        state.conv_original_volume = None;
-                        state.conv_conversation_started = false;
-                    } else {
-                        debug!(
-                            "Received status 6 but conversation was not started; ignoring restore"
-                        );
-                        return;
-                    }
-                }
-                if let Some(orig) = maybe_original {
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, orig))
-                        .await
-                        .unwrap_or(false);
-                    info!("Conversation end (6): restored volume to original {}", orig);
-                } else {
-                    debug!("No stored original volume to restore to on status 6");
-                }
-            }
-            7 => {
-                let mut maybe_original = None;
-                {
-                    let mut state = self.state.lock().await;
-                    if state.conv_conversation_started {
-                        maybe_original = state.conv_original_volume;
-                        state.conv_original_volume = None;
-                        state.conv_conversation_started = false;
-                    } else {
-                        debug!(
-                            "Received status 7 but conversation was not started; ignoring restore"
-                        );
-                        return;
-                    }
-                }
-                if let Some(orig) = maybe_original {
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, orig))
-                        .await
-                        .unwrap_or(false);
-                    info!("Conversation end (7): restored volume to original {}", orig);
-                } else {
-                    debug!("No stored original volume to restore to on status 7");
+                    audio_cmd_transition_volume(&audio_tx, &sink, orig).await;
+                    info!("Conversation end ({}): restored volume to original {}", status, orig);
                 }
             }
             _ => {
@@ -1206,228 +1204,4 @@ impl MediaController {
             }
         }
     }
-}
-
-fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
-    let mut mainloop = Mainloop::new().unwrap();
-    let mut context = Context::new(&mainloop, "LibrePods-get_sink_volume").unwrap();
-    context
-        .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-        .unwrap();
-    loop {
-        match mainloop.iterate(false) {
-            _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-            _ if context.get_state() == libpulse_binding::context::State::Failed
-                || context.get_state() == libpulse_binding::context::State::Terminated =>
-            {
-                return None;
-            }
-            _ => {}
-        }
-    }
-
-    let introspector = context.introspect();
-    let sink_info_option = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info_option = sink_info_option.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                let owned_item = OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
-                };
-                *sink_info_option.borrow_mut() = Some(owned_item);
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
-
-    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
-        let channels = sink_info.volume.len();
-        if channels == 0 {
-            return None;
-        }
-        let total: f64 = sink_info.volume.get().iter().map(|v| v.0 as f64).sum();
-        let average_raw = total / channels as f64;
-        let percent = ((average_raw / Volume::NORMAL.0 as f64) * 100.0).round() as u32;
-        Some(percent)
-    } else {
-        None
-    }
-}
-
-fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
-    let mut mainloop = Mainloop::new().unwrap();
-    let mut context = Context::new(&mainloop, "LibrePods-set_card_profile").unwrap();
-    context
-        .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-        .unwrap();
-
-    loop {
-        match mainloop.iterate(false) {
-            _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-            _ if context.get_state() == libpulse_binding::context::State::Failed
-                || context.get_state() == libpulse_binding::context::State::Terminated =>
-            {
-                return false;
-            }
-            _ => {}
-        }
-    }
-
-    let mut introspector = context.introspect();
-    let op = introspector.set_card_profile_by_index(card_index, profile_name, None);
-
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    mainloop.quit(Retval(0));
-
-    true
-}
-
-pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
-    let mut mainloop = Mainloop::new().unwrap();
-    let mut context = Context::new(&mainloop, "LibrePods-transition_sink_volume").unwrap();
-    context
-        .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-        .unwrap();
-    loop {
-        match mainloop.iterate(false) {
-            _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-            _ if context.get_state() == libpulse_binding::context::State::Failed
-                || context.get_state() == libpulse_binding::context::State::Terminated =>
-            {
-                return false;
-            }
-            _ => {}
-        }
-    }
-
-    let mut introspector = context.introspect();
-    let sink_info_option = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info_option = sink_info_option.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                let owned_item = OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
-                };
-                *sink_info_option.borrow_mut() = Some(owned_item);
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
-        let channels = sink_info.volume.len();
-        let mut new_volumes = ChannelVolumes::default();
-        let raw =
-            (((target_volume as f64) / 100.0) * Volume::NORMAL.0.as_f64().unwrap()).round() as u32;
-        let vol = Volume(raw);
-        new_volumes.set(channels, vol);
-
-        let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
-        mainloop.quit(Retval(0));
-        true
-    } else {
-        error!("Sink not found: {}", sink_name);
-        false
-    }
-}
-
-async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
-    debug!("Entering get_sink_name_by_mac for MAC: {}", mac);
-    if mac.is_empty() {
-        debug!("MAC is empty, returning None");
-        return None;
-    }
-    let mac_clone = mac.to_string();
-
-    tokio::task::spawn_blocking(move || {
-        let mut mainloop = Mainloop::new().unwrap();
-        let mut context = Context::new(&mainloop, "LibrePods-get_sink_name_by_mac").unwrap();
-        context
-            .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-            .unwrap();
-
-        loop {
-            match mainloop.iterate(false) {
-                _ if context.get_state() == libpulse_binding::context::State::Ready => break,
-                _ if context.get_state() == libpulse_binding::context::State::Failed
-                    || context.get_state() == libpulse_binding::context::State::Terminated =>
-                {
-                    return None;
-                }
-                _ => {}
-            }
-        }
-
-        let introspector = context.introspect();
-        let sink_info_list = Rc::new(RefCell::new(Some(Vec::new())));
-        let op = introspector.get_sink_info_list({
-            let sink_info_list = sink_info_list.clone();
-            move |result: ListResult<&SinkInfo>| {
-                if let ListResult::Item(item) = result {
-                    let owned_item = OwnedSinkInfo {
-                        name: item.name.as_ref().map(|s| s.to_string()),
-                        proplist: item.proplist.clone(),
-                        volume: item.volume,
-                    };
-                    sink_info_list
-                        .borrow_mut()
-                        .as_mut()
-                        .unwrap()
-                        .push(owned_item);
-                }
-            }
-        });
-
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
-        mainloop.quit(Retval(0));
-
-        if let Some(list) = sink_info_list.borrow().as_ref() {
-            for sink in list {
-                if let Some(device_string) = sink.proplist.get_str("device.string")
-                    && device_string
-                        .to_uppercase()
-                        .contains(&mac_clone.to_uppercase())
-                    && let Some(name) = &sink.name
-                {
-                    info!("Found sink name for MAC {}: {}", mac_clone, name);
-                    return Some(name.to_string());
-                }
-                if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
-                    let mac_from_path = bluez_path
-                        .split('/')
-                        .next_back()
-                        .unwrap_or("")
-                        .replace("dev_", "")
-                        .replace('_', ":");
-                    if mac_from_path.eq_ignore_ascii_case(&mac_clone)
-                        && let Some(name) = &sink.name
-                    {
-                        info!("Found sink name for MAC {}: {}", mac_clone, name);
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        error!("No matching sink found for MAC address: {}", mac_clone);
-        None
-    })
-    .await
-    .unwrap_or(None)
 }

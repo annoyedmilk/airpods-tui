@@ -37,9 +37,6 @@ pub mod opcodes {
     pub const AUDIO_SOURCE: u8 = 0x0E;
     pub const SMART_ROUTING: u8 = 0x10;
     pub const SMART_ROUTING_RESP: u8 = 0x11;
-    pub const SEND_CONNECTED_MAC: u8 = 0x14;
-    pub const HEADTRACKING: u8 = 0x17;
-    pub const TIPI_3: u8 = 0x0C;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -280,7 +277,7 @@ pub enum AACPEvent {
     ControlCommand(ControlCommandStatus),
     EarDetection(Vec<EarDetectionStatus>, Vec<EarDetectionStatus>),
     ConversationalAwareness(u8),
-    ProximityKeys(Vec<(u8, Vec<u8>)>),
+    #[allow(dead_code)]
     AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
@@ -310,6 +307,9 @@ pub struct AACPManagerState {
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
+    /// Notified after every successfully parsed incoming packet, allowing callers
+    /// to wait for a device response instead of using fixed sleeps.
+    pub packet_received: Arc<tokio::sync::Notify>,
 }
 
 impl AACPManagerState {
@@ -333,6 +333,7 @@ impl AACPManagerState {
             event_tx: None,
             devices,
             airpods_mac: None,
+            packet_received: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -903,6 +904,9 @@ impl AACPManager {
             }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
+
+        // Notify anyone waiting for a device response (replaces fixed sleep delays)
+        self.state.lock().await.packet_received.notify_waiters();
     }
 
     pub async fn send_notification_request(&self) -> Result<()> {
@@ -1116,35 +1120,6 @@ impl AACPManager {
         buffer.push(0xA2);
 
         while buffer.len() < 134 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(97);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x59, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE3]);
-        buffer.push(0x5F);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x59);
-        buffer.extend_from_slice(b"audioRoutingShowReverseUI");
-        buffer.push(0x01);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reason");
-        buffer.push(0x53);
-        buffer.extend_from_slice(b"ReverseBannerTapped");
-
-        while buffer.len() < 97 {
             buffer.push(0x00);
         }
 

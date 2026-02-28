@@ -4,6 +4,12 @@ use crate::tui::app::{App, DeviceState, FocusedSection, SettingsItem};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    // Rename mode intercepts all keys
+    if app.rename_mode.is_some() {
+        handle_rename_key(app, key);
+        return;
+    }
+
     match key.code {
         // Quit
         KeyCode::Char('q') => app.should_quit = true,
@@ -116,6 +122,41 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // Space/Enter — activate the focused row
         KeyCode::Char(' ') | KeyCode::Enter => activate_row(app),
 
+        // Enter rename mode
+        KeyCode::Char('r') => {
+            if let Some(DeviceState::AirPods(s)) = app.selected_device() {
+                app.rename_mode = Some(s.name.clone());
+            }
+        }
+
+        _ => {}
+    }
+}
+
+fn handle_rename_key(app: &mut App, key: KeyEvent) {
+    let Some(ref mut buf) = app.rename_mode else { return };
+    match key.code {
+        KeyCode::Enter => {
+            let new_name = buf.clone();
+            if let Some(mac) = app.selected_mac().cloned() {
+                if let Some(DeviceState::AirPods(s)) = app.devices.get_mut(&mac) {
+                    s.name = new_name.clone();
+                }
+                app.send_rename(&mac, new_name);
+            }
+            app.rename_mode = None;
+        }
+        KeyCode::Esc => {
+            app.rename_mode = None;
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            if buf.len() < 32 {
+                buf.push(c);
+            }
+        }
         _ => {}
     }
 }
@@ -221,14 +262,8 @@ fn activate_settings_row(app: &mut App) {
                     _ => {}
                 }
             }
-            let byte = match cmd {
-                ControlCommandIdentifiers::ConversationDetectConfig => {
-                    if new_val { 0x01 } else { 0x02 }
-                }
-                _ => {
-                    if new_val { 0x01 } else { 0x00 }
-                }
-            };
+            // All AACP toggle commands use 0x01 = enabled, 0x02 = disabled
+            let byte: u8 = if new_val { 0x01 } else { 0x02 };
             app.send_command(&mac, cmd, vec![byte]);
         }
         SettingsItem::Enum { value, options, cmd, .. } => {

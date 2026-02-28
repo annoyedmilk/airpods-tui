@@ -1,5 +1,6 @@
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType, StemPressType};
+use crate::config::Config;
 use crate::media_controller::MediaController;
 use crate::tui::app::AppEvent;
 use bluer::Address;
@@ -8,12 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 pub struct AirPodsDevice {
-    pub mac_address: Address,
     pub aacp_manager: AACPManager,
-    pub media_controller: Arc<Mutex<MediaController>>,
 }
 
 impl AirPodsDevice {
@@ -21,6 +20,7 @@ impl AirPodsDevice {
         mac_address: Address,
         app_tx: UnboundedSender<AppEvent>,
         product_id: u16,
+        config: Config,
     ) -> Self {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -88,19 +88,24 @@ impl AirPodsDevice {
         });
 
         // ── Now send protocol packets (responses will be caught by channels above) ──
+        // Instead of fixed sleeps between packets, we wait for the device to respond
+        // (or time out after 500ms). AACP has no formal ACK, but the device typically
+        // sends a response packet after processing each command.
+        let notify = aacp_manager.state.lock().await.packet_received.clone();
+
         info!("Sending handshake");
         if let Err(e) = aacp_manager.send_handshake().await {
             error!("Failed to send handshake to AirPods device: {}", e);
         }
 
-        sleep(Duration::from_millis(100)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
 
         info!("Setting feature flags");
         if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
             error!("Failed to set feature flags: {}", e);
         }
 
-        sleep(Duration::from_millis(100)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
 
         info!("Requesting notifications");
         if let Err(e) = aacp_manager.send_notification_request().await {
@@ -114,7 +119,7 @@ impl AirPodsDevice {
 
         if crate::devices::apple_models::needs_init_ext(product_id) {
             info!("Sending AapInitExt for model 0x{:04x} (unlocks Adaptive ANC)", product_id);
-            sleep(Duration::from_millis(100)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
             if let Err(e) = aacp_manager.send_init_ext().await {
                 error!("Failed to send AapInitExt: {}", e);
             }
@@ -145,6 +150,7 @@ impl AirPodsDevice {
         let media_controller = Arc::new(Mutex::new(MediaController::new(
             mac_address.to_string(),
             local_mac.clone(),
+            config,
         )));
         let mc_clone = media_controller.clone();
 
@@ -271,10 +277,11 @@ impl AirPodsDevice {
             }
         });
 
+        // media_controller and mac_address are used by spawned tasks above
+        // but not needed in the struct after initialization
+        let _ = media_controller;
         AirPodsDevice {
-            mac_address,
             aacp_manager,
-            media_controller,
         }
     }
 }

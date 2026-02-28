@@ -1,7 +1,6 @@
 use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub fn get_devices_path() -> PathBuf {
@@ -18,14 +17,6 @@ pub fn get_preferences_path() -> PathBuf {
     PathBuf::from(config_dir)
         .join("librepods")
         .join("preferences.json")
-}
-
-pub fn get_app_settings_path() -> PathBuf {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_default()));
-    PathBuf::from(config_dir)
-        .join("librepods")
-        .join("app_settings.json")
 }
 
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
@@ -50,58 +41,4 @@ pub fn ah(k: &[u8; 16], r: &[u8; 3]) -> [u8; 3] {
     hash
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum MyTheme {
-    Light,
-    Dark,
-    Dracula,
-    Nord,
-    SolarizedLight,
-    SolarizedDark,
-    GruvboxLight,
-    GruvboxDark,
-    CatppuccinLatte,
-    CatppuccinFrappe,
-    CatppuccinMacchiato,
-    CatppuccinMocha,
-    TokyoNight,
-    TokyoNightStorm,
-    TokyoNightLight,
-    KanagawaWave,
-    KanagawaDragon,
-    KanagawaLotus,
-    Moonfly,
-    Nightfly,
-    Oxocarbon,
-    Ferra,
-}
-
-impl std::fmt::Display for MyTheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-            Self::Dracula => "Dracula",
-            Self::Nord => "Nord",
-            Self::SolarizedLight => "Solarized Light",
-            Self::SolarizedDark => "Solarized Dark",
-            Self::GruvboxLight => "Gruvbox Light",
-            Self::GruvboxDark => "Gruvbox Dark",
-            Self::CatppuccinLatte => "Catppuccin Latte",
-            Self::CatppuccinFrappe => "Catppuccin Frappé",
-            Self::CatppuccinMacchiato => "Catppuccin Macchiato",
-            Self::CatppuccinMocha => "Catppuccin Mocha",
-            Self::TokyoNight => "Tokyo Night",
-            Self::TokyoNightStorm => "Tokyo Night Storm",
-            Self::TokyoNightLight => "Tokyo Night Light",
-            Self::KanagawaWave => "Kanagawa Wave",
-            Self::KanagawaDragon => "Kanagawa Dragon",
-            Self::KanagawaLotus => "Kanagawa Lotus",
-            Self::Moonfly => "Moonfly",
-            Self::Nightfly => "Nightfly",
-            Self::Oxocarbon => "Oxocarbon",
-            Self::Ferra => "Ferra",
-        })
-    }
-}
 

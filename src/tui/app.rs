@@ -4,12 +4,16 @@ use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 #[derive(Debug, Clone)]
+pub enum DeviceCommand {
+    ControlCommand(ControlCommandIdentifiers, Vec<u8>),
+    Rename(String),
+}
+
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     DeviceConnected { mac: String, name: String, is_nothing: bool, product_id: u16 },
     DeviceDisconnected(String),
     AACPEvent(String, AACPEvent),
-    ATTNotification(String, u16, Vec<u8>),
-    VolumeUpdate(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,18 +118,16 @@ pub struct App {
     pub selected_device_idx: usize,
     pub focused_section: FocusedSection,
     pub section_row: usize,
-    pub settings_scroll: usize,
     pub rx: UnboundedReceiver<AppEvent>,
     pub should_quit: bool,
-    pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, ControlCommandIdentifiers, Vec<u8>)>>,
-    pub current_volume: Option<u8>,
-    pub volume_display_until: Option<std::time::Instant>,
+    pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, DeviceCommand)>>,
+    pub rename_mode: Option<String>,
 }
 
 impl App {
     pub fn new(
         rx: UnboundedReceiver<AppEvent>,
-        command_tx: tokio::sync::mpsc::UnboundedSender<(String, ControlCommandIdentifiers, Vec<u8>)>,
+        command_tx: tokio::sync::mpsc::UnboundedSender<(String, DeviceCommand)>,
     ) -> Self {
         Self {
             devices: HashMap::new(),
@@ -133,12 +135,10 @@ impl App {
             selected_device_idx: 0,
             focused_section: FocusedSection::NoiseControl,
             section_row: 0,
-            settings_scroll: 0,
             rx,
             should_quit: false,
             command_tx: Some(command_tx),
-            current_volume: None,
-            volume_display_until: None,
+            rename_mode: None,
         }
     }
 
@@ -292,15 +292,6 @@ impl App {
                 AppEvent::AACPEvent(mac, event) => {
                     self.handle_aacp_event(&mac, event);
                 }
-                AppEvent::ATTNotification(mac, handle, data) => {
-                    self.handle_att_notification(&mac, handle, data);
-                }
-                AppEvent::VolumeUpdate(vol) => {
-                    self.current_volume = Some(vol);
-                    self.volume_display_until = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(2),
-                    );
-                }
             }
         }
     }
@@ -424,13 +415,15 @@ impl App {
         }
     }
 
-    fn handle_att_notification(&mut self, mac: &str, _handle: u16, _data: Vec<u8>) {
-        log::debug!("ATT notification from {}", mac);
-    }
-
     pub fn send_command(&self, mac: &str, id: ControlCommandIdentifiers, value: Vec<u8>) {
         if let Some(tx) = &self.command_tx {
-            let _ = tx.send((mac.to_string(), id, value));
+            let _ = tx.send((mac.to_string(), DeviceCommand::ControlCommand(id, value)));
+        }
+    }
+
+    pub fn send_rename(&self, mac: &str, name: String) {
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send((mac.to_string(), DeviceCommand::Rename(name)));
         }
     }
 }

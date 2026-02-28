@@ -18,7 +18,6 @@ pub struct NothingInformation {
 
 pub struct NothingDevice {
     pub att_manager: ATTManager,
-    pub information: NothingInformation,
 }
 
 impl NothingDevice {
@@ -171,9 +170,9 @@ impl NothingDevice {
             }
         });
 
+        let _ = information; // used by spawned task above
         NothingDevice {
             att_manager,
-            information,
         }
     }
 }

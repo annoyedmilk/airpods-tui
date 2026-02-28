@@ -1,4 +1,3 @@
-use crate::bluetooth::aacp::BatteryInfo;
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::nothing::NothingInformation;
 use serde::{Deserialize, Serialize};
@@ -31,31 +30,6 @@ pub struct DeviceData {
     pub name: String,
     pub type_: DeviceType,
     pub information: Option<DeviceInformation>,
-}
-
-#[derive(Clone, Debug)]
-pub enum DeviceState {
-    AirPods(AirPodsState),
-    Nothing(NothingState),
-}
-
-impl Display for DeviceState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviceState::AirPods(_) => write!(f, "AirPods State"),
-            DeviceState::Nothing(_) => write!(f, "Nothing State"),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AirPodsState {
-    pub device_name: String,
-    pub noise_control_mode: AirPodsNoiseControlMode,
-    pub conversation_awareness_enabled: bool,
-    pub personalized_volume_enabled: bool,
-    pub allow_off_mode: bool,
-    pub battery: Vec<BatteryInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,11 +71,7 @@ impl AirPodsNoiseControlMode {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct NothingState {
-    pub anc_mode: NothingAncMode,
-}
-
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum NothingAncMode {
     Off,
@@ -124,6 +94,7 @@ impl Display for NothingAncMode {
         }
     }
 }
+#[allow(dead_code)]
 impl NothingAncMode {
     pub fn from_byte(value: u8) -> Self {
         match value {

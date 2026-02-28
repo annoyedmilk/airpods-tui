@@ -59,6 +59,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     draw_content(f, chunks[1], app);
     draw_footer(f, chunks[2], app);
+
+    // Rename popup overlay
+    if let Some(ref buf) = app.rename_mode {
+        draw_rename_popup(f, inner, buf);
+    }
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
@@ -248,7 +253,7 @@ fn draw_noise_options(
         let is_focused = focused && section_row == i;
         let active = std::mem::discriminant(mode) == std::mem::discriminant(&state.listening_mode);
         f.render_widget(
-            Paragraph::new(radio_option(&mode.to_string(), is_focused, active)),
+            Paragraph::new(noise_row(&mode.to_string(), is_focused, active)),
             rows[i],
         );
     }
@@ -378,23 +383,24 @@ fn name_line(display_name: &str) -> Line<'_> {
     ])
 }
 
-fn radio_option(label: &str, focused: bool, active: bool) -> Line<'static> {
+fn noise_row(label: &str, focused: bool, active: bool) -> Line<'static> {
     let prefix = if focused {
         Span::styled("  ▸ ", Style::default().fg(ACCENT))
     } else {
         Span::raw("    ")
     };
-    let dot = if active {
-        Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-    } else {
-        Span::styled("○ ", Style::default().fg(DIM))
-    };
-    let text_style = if focused || active {
+    let text_style = if active {
+        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+    } else if focused {
         Style::default().fg(FG)
     } else {
         Style::default().fg(DIM)
     };
-    Line::from(vec![prefix, dot, Span::styled(label.to_string(), text_style)])
+    let mut spans = vec![prefix, Span::styled(label.to_string(), text_style)];
+    if active {
+        spans.push(Span::styled("  (Active)", Style::default().fg(ACCENT)));
+    }
+    Line::from(spans)
 }
 
 fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'a> {
@@ -429,8 +435,56 @@ fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
         Span::styled(" select", Style::default().fg(DIM)),
         Span::styled("  1-3", Style::default().fg(ACCENT)),
         Span::styled(" noise", Style::default().fg(DIM)),
+        Span::styled("  r", Style::default().fg(ACCENT)),
+        Span::styled(" rename", Style::default().fg(DIM)),
     ]);
     f.render_widget(Paragraph::new(keys).alignment(Alignment::Center), area);
+}
+
+fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
+    let popup = centered_rect(area, 60, 30);
+    // Clear the area behind the popup
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Rename Device ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Input line with cursor
+    let input_text = format!(" {}▏", buf);
+    f.render_widget(
+        Paragraph::new(input_text).style(Style::default().fg(FG)),
+        chunks[1],
+    );
+
+    // Help text
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(ACCENT)),
+            Span::styled(" confirm  ", Style::default().fg(DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT)),
+            Span::styled(" cancel", Style::default().fg(DIM)),
+        ]))
+        .alignment(Alignment::Center),
+        chunks[3],
+    );
 }
 
 fn shrink(area: Rect, h: u16, v: u16) -> Rect {

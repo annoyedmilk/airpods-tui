@@ -12,7 +12,6 @@ const PSM_ATT: u16 = 0x001F;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-const OPCODE_READ_REQUEST: u8 = 0x0A;
 const OPCODE_WRITE_REQUEST: u8 = 0x12;
 const OPCODE_HANDLE_VALUE_NTF: u8 = 0x1B;
 const OPCODE_WRITE_RESPONSE: u8 = 0x13;
@@ -21,31 +20,8 @@ const RESPONSE_TIMEOUT: u64 = 5000;
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ATTHandles {
-    AirPodsTransparency = 0x18,
-    AirPodsLoudSoundReduction = 0x1B,
-    AirPodsHearingAid = 0x2A,
     NothingEverything = 0x8002,
     NothingEverythingRead = 0x8005, // for some reason, and not the same as the write handle
-}
-
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ATTCCCDHandles {
-    Transparency = ATTHandles::AirPodsTransparency as u16 + 1,
-    LoudSoundReduction = ATTHandles::AirPodsLoudSoundReduction as u16 + 1,
-    HearingAid = ATTHandles::AirPodsHearingAid as u16 + 1,
-}
-
-impl From<ATTHandles> for ATTCCCDHandles {
-    fn from(handle: ATTHandles) -> Self {
-        match handle {
-            ATTHandles::AirPodsTransparency => ATTCCCDHandles::Transparency,
-            ATTHandles::AirPodsLoudSoundReduction => ATTCCCDHandles::LoudSoundReduction,
-            ATTHandles::AirPodsHearingAid => ATTCCCDHandles::HearingAid,
-            ATTHandles::NothingEverything => panic!("No CCCD for NothingEverything handle"), // we don't request it
-            ATTHandles::NothingEverythingRead => panic!("No CCD for NothingEverythingRead handle"), // it sends notifications without CCCD
-        }
-    }
 }
 
 struct ATTManagerState {
@@ -154,29 +130,7 @@ impl ATTManager {
         state.listeners.entry(handle as u16).or_default().push(tx);
     }
 
-    pub async fn enable_notifications(&self, handle: ATTHandles) -> Result<()> {
-        self.write_cccd(handle.into(), &[0x01, 0x00]).await
-    }
-
-    pub async fn read(&self, handle: ATTHandles) -> Result<Vec<u8>> {
-        let lsb = (handle as u16 & 0xFF) as u8;
-        let msb = ((handle as u16 >> 8) & 0xFF) as u8;
-        let pdu = vec![OPCODE_READ_REQUEST, lsb, msb];
-        self.send_packet(&pdu).await?;
-        self.read_response().await
-    }
-
     pub async fn write(&self, handle: ATTHandles, value: &[u8]) -> Result<()> {
-        let lsb = (handle as u16 & 0xFF) as u8;
-        let msb = ((handle as u16 >> 8) & 0xFF) as u8;
-        let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];
-        pdu.extend_from_slice(value);
-        self.send_packet(&pdu).await?;
-        self.read_response().await?;
-        Ok(())
-    }
-
-    async fn write_cccd(&self, handle: ATTCCCDHandles, value: &[u8]) -> Result<()> {
         let lsb = (handle as u16 & 0xFF) as u8;
         let msb = ((handle as u16 >> 8) & 0xFF) as u8;
         let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];

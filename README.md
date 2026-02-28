@@ -10,9 +10,10 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 - Noise control (Transparency, Adaptive, Noise Cancellation)
 - Settings: Conversation Awareness, One-Bud ANC, Personalized Volume, Volume Swipe, Press Speed, Tone Volume, and more
 - Stem press media controls (play/pause, next/prev track)
-- Volume swipe synced to system volume via WirePlumber + SwayOSD
+- Device renaming
+- Volume swipe synced to system volume via configurable commands
 - Waybar JSON output (`--waybar` / `--waybar-watch`)
-- Supports 25+ Apple/Beats models with per-model capability detection
+- Supports 26 Apple/Beats models with per-model capability detection
 
 ## Usage
 
@@ -34,12 +35,23 @@ airpods-tui -d           # enable debug logging (/tmp/airpods-tui.log)
 | `Space` / `Enter` | Toggle / select |
 | `1-3` | Noise mode shortcut |
 | `c` | Toggle Conversation Awareness |
+| `r` | Rename device |
+
+## Configuration
+
+Optional config at `~/.config/airpods-tui/config.toml`:
+
+```toml
+volume_osd_command = ["swayosd-client", "--output-volume", "{}"]
+volume_set_command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "{}"]
+# restart_audio_server = ["systemctl", "--user", "restart", "wireplumber"]
+```
 
 ## Dependencies
 
 - BlueZ (D-Bus)
 - PipeWire + WirePlumber (`wpctl`)
-- SwayOSD (volume overlay)
+- SwayOSD (volume overlay, configurable)
 
 ## Building
 
