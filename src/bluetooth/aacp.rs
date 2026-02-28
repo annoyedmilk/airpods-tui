@@ -8,6 +8,7 @@ use bluer::{
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,14 +40,14 @@ pub mod opcodes {
     pub const SMART_ROUTING_RESP: u8 = 0x11;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ControlCommandStatus {
     pub identifier: ControlCommandIdentifiers,
     pub value: Vec<u8>,
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 pub enum ControlCommandIdentifiers {
     MicMode = 0x01,
     ButtonSendMode = 0x05,
@@ -189,7 +190,7 @@ impl ProximityKeyType {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum StemPressType {
     SinglePress = 0x05,
     DoublePress = 0x06,
@@ -198,14 +199,14 @@ pub enum StemPressType {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum StemPressBudType {
     Left = 0x01,
     Right = 0x02,
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum AudioSourceType {
     None = 0x00,
     Call = 0x01,
@@ -213,7 +214,7 @@ pub enum AudioSourceType {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum BatteryComponent {
     Headphone = 1,
     Left = 4,
@@ -222,7 +223,7 @@ pub enum BatteryComponent {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum BatteryStatus {
     Charging = 1,
     NotCharging = 2,
@@ -231,7 +232,7 @@ pub enum BatteryStatus {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum EarDetectionStatus {
     InEar = 0x00,
     OutOfEar = 0x01,
@@ -250,20 +251,20 @@ impl AudioSourceType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioSource {
     pub mac: String,
     pub r#type: AudioSourceType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatteryInfo {
     pub component: BatteryComponent,
     pub level: u8,
     pub status: BatteryStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectedDevice {
     pub mac: String,
     pub info1: u8,
@@ -271,7 +272,7 @@ pub struct ConnectedDevice {
     pub r#type: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AACPEvent {
     BatteryInfo(Vec<BatteryInfo>),
     ControlCommand(ControlCommandStatus),

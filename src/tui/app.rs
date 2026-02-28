@@ -1,15 +1,16 @@
 use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryStatus, ControlCommandIdentifiers};
 use crate::devices::enums::{AirPodsNoiseControlMode, NothingAncMode};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeviceCommand {
     ControlCommand(ControlCommandIdentifiers, Vec<u8>),
     Rename(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppEvent {
     DeviceConnected { mac: String, name: String, is_nothing: bool, product_id: u16 },
     DeviceDisconnected(String),

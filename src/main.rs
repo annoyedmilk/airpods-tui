@@ -1,6 +1,7 @@
 mod bluetooth;
 mod config;
 mod devices;
+mod ipc;
 mod media_controller;
 mod tui;
 mod utils;
@@ -134,23 +135,68 @@ fn main() -> io::Result<()> {
     let bt_config = config.clone();
 
     if args.daemon {
-        // Headless daemon mode: run bluetooth_main directly, drain events
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut app_rx = app_rx;
-        rt.spawn(async move {
-            while app_rx.recv().await.is_some() {}
+        rt.block_on(async move {
+            let snapshot: ipc::StateSnapshot =
+                Arc::new(RwLock::new(Vec::new()));
+            let ipc_server = Arc::new(ipc::IpcServer::new(snapshot.clone(), cmd_tx));
+
+            // Task: update snapshot and broadcast events to IPC clients
+            let ipc_server_clone = ipc_server.clone();
+            let snapshot_clone = snapshot.clone();
+            let mut app_rx = app_rx;
+            tokio::spawn(async move {
+                while let Some(event) = app_rx.recv().await {
+                    {
+                        let mut snap = snapshot_clone.write().await;
+                        ipc::update_snapshot(&mut snap, &event);
+                    }
+                    ipc_server_clone.broadcast(&event);
+                }
+            });
+
+            // Task: IPC server
+            let ipc_handle = tokio::spawn(async move {
+                if let Err(e) = ipc_server.run().await {
+                    log::error!("IPC server error: {}", e);
+                }
+            });
+
+            // Run bluetooth_main (blocks on D-Bus listener)
+            if let Err(e) = bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config).await {
+                log::error!("Bluetooth error: {}", e);
+            }
+
+            ipc_handle.abort();
         });
-        rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config))
-            .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
         return Ok(());
     }
 
-    // Spawn bluetooth runtime in a background thread
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config))
-            .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
-    });
+    // Try connecting to a running daemon via IPC first.
+    // The runtime must stay alive so the IPC reader/writer tasks keep running.
+    let ipc_rt = tokio::runtime::Runtime::new().unwrap();
+    let ipc_result = ipc_rt.block_on(ipc::ipc_connect());
+
+    let (_ipc_rt_guard, app_rx, cmd_tx) = if let Ok((ipc_cmd_tx, ipc_event_rx)) = ipc_result {
+        info!("Connected to daemon via IPC");
+        drop(app_tx_bt);
+        drop(dm_clone);
+        drop(bt_config);
+        drop(app_rx);
+        drop(cmd_rx);
+        drop(cmd_tx);
+        // Keep ipc_rt alive — its spawned tasks handle the socket I/O
+        (Some(ipc_rt), ipc_event_rx, ipc_cmd_tx)
+    } else {
+        drop(ipc_rt);
+        info!("No daemon running, starting in-process Bluetooth");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config))
+                .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
+        });
+        (None, app_rx, cmd_tx)
+    };
 
     // Set up terminal
     enable_raw_mode()?;

@@ -32,7 +32,7 @@ pub struct DeviceData {
     pub information: Option<DeviceInformation>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AirPodsNoiseControlMode {
     Off,
     NoiseCancellation,
@@ -72,7 +72,7 @@ impl AirPodsNoiseControlMode {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NothingAncMode {
     Off,
     LowNoiseCancellation,
