@@ -595,6 +595,7 @@ async fn bluetooth_main(
 
     // Command dispatcher — receives (mac, DeviceCommand) from TUI
     let dm_cmd = device_managers.clone();
+    let adapter_cmd = adapter.clone();
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
             let managers = dm_cmd.read().await;
@@ -609,6 +610,13 @@ async fn bluetooth_main(
                         tui::app::DeviceCommand::Rename(name) => {
                             if let Err(e) = aacp.send_rename_packet(&name).await {
                                 log::error!("Failed to send rename: {}", e);
+                            }
+                            // Also update the BlueZ alias so the OS sees the new name
+                            if let Ok(addr) = mac.parse::<Address>()
+                                && let Ok(device) = adapter_cmd.device(addr)
+                                && let Err(e) = device.set_alias(name).await
+                            {
+                                log::error!("Failed to set BlueZ alias: {}", e);
                             }
                         }
                     }

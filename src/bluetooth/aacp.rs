@@ -311,6 +311,8 @@ pub struct AACPManagerState {
     /// Notified after every successfully parsed incoming packet, allowing callers
     /// to wait for a device response instead of using fixed sleeps.
     pub packet_received: Arc<tokio::sync::Notify>,
+    /// Broadcasts the opcode of every incoming packet for strict init sequencing.
+    pub opcode_tx: tokio::sync::broadcast::Sender<u8>,
 }
 
 impl AACPManagerState {
@@ -335,6 +337,7 @@ impl AACPManagerState {
             devices,
             airpods_mac: None,
             packet_received: Arc::new(tokio::sync::Notify::new()),
+            opcode_tx: tokio::sync::broadcast::channel(16).0,
         }
     }
 }
@@ -491,6 +494,9 @@ impl AACPManager {
 
         let opcode = packet[4];
         let payload = &packet[4..];
+
+        // Broadcast opcode for strict init sequencing
+        let _ = self.state.lock().await.opcode_tx.send(opcode);
 
         match opcode {
             opcodes::BATTERY_INFO => {

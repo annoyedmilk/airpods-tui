@@ -1,5 +1,5 @@
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
-use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType, StemPressType};
+use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType, StemPressType, opcodes};
 use crate::config::Config;
 use crate::media_controller::MediaController;
 use crate::tui::app::AppEvent;
@@ -88,29 +88,27 @@ impl AirPodsDevice {
         });
 
         // ── Now send protocol packets (responses will be caught by channels above) ──
-        // Instead of fixed sleeps between packets, we wait for the device to respond
-        // (or time out after 500ms). AACP has no formal ACK, but the device typically
-        // sends a response packet after processing each command.
-        let notify = aacp_manager.state.lock().await.packet_received.clone();
+        // Uses strict opcode matching: each step waits for the device to respond with
+        // a specific opcode (or times out after 500ms) before proceeding.
 
         info!("Sending handshake");
         if let Err(e) = aacp_manager.send_handshake().await {
             error!("Failed to send handshake to AirPods device: {}", e);
         }
-
-        let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
+        // Handshake has no specific AACP opcode response; wait for any packet
+        let _ = Self::wait_for_any_opcode(&aacp_manager, 500).await;
 
         info!("Setting feature flags");
         if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
             error!("Failed to set feature flags: {}", e);
         }
-
-        let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
+        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
 
         info!("Requesting notifications");
         if let Err(e) = aacp_manager.send_notification_request().await {
             error!("Failed to request notifications: {}", e);
         }
+        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::REQUEST_NOTIFICATIONS, 500).await;
 
         info!("sending some packet");
         if let Err(e) = aacp_manager.send_some_packet().await {
@@ -119,7 +117,7 @@ impl AirPodsDevice {
 
         if crate::devices::apple_models::needs_init_ext(product_id) {
             info!("Sending AapInitExt for model 0x{:04x} (unlocks Adaptive ANC)", product_id);
-            let _ = tokio::time::timeout(Duration::from_millis(500), notify.notified()).await;
+            let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
             if let Err(e) = aacp_manager.send_init_ext().await {
                 error!("Failed to send AapInitExt: {}", e);
             }
@@ -132,6 +130,7 @@ impl AirPodsDevice {
         {
             error!("Failed to request proximity keys: {}", e);
         }
+        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::PROXIMITY_KEYS_RSP, 500).await;
 
         // ── Media controller setup ──
         let session = bluer::Session::new().await?;
@@ -275,6 +274,28 @@ impl AirPodsDevice {
         Ok(AirPodsDevice {
             aacp_manager,
         })
+    }
+
+    /// Wait for a specific opcode to arrive on the broadcast channel.
+    /// Returns Ok(()) when the expected opcode is received, or Err on timeout.
+    async fn wait_for_opcode(aacp_manager: &AACPManager, expected_opcode: u8, timeout_ms: u64) -> Result<(), &'static str> {
+        let mut rx = aacp_manager.state.lock().await.opcode_tx.subscribe();
+        tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            loop {
+                if let Ok(opcode) = rx.recv().await
+                    && opcode == expected_opcode {
+                    return;
+                }
+            }
+        }).await.map_err(|_| "Timeout waiting for opcode")
+    }
+
+    /// Wait for any opcode to arrive (used for handshake which has no specific response).
+    async fn wait_for_any_opcode(aacp_manager: &AACPManager, timeout_ms: u64) -> Result<(), &'static str> {
+        let mut rx = aacp_manager.state.lock().await.opcode_tx.subscribe();
+        tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            let _ = rx.recv().await;
+        }).await.map_err(|_| "Timeout waiting for any opcode")
     }
 }
 

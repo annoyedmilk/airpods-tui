@@ -331,7 +331,10 @@ impl App {
                                 state.battery_right = Some((b.level, b.status));
                             }
                             BatteryComponent::Case => {
-                                state.battery_case = Some((b.level, b.status));
+                                // Only update if not disconnected — preserve last known good value
+                                if b.status != BatteryStatus::Disconnected {
+                                    state.battery_case = Some((b.level, b.status));
+                                }
                             }
                             BatteryComponent::Headphone => {
                                 state.battery_headphone = Some((b.level, b.status));

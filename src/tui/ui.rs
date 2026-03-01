@@ -14,36 +14,21 @@ const FOCUS_COLOR: Color = Color::Green;
 const HEADER: Color = Color::Yellow;
 const FG: Color = Color::White;
 const DIM: Color = Color::DarkGray;
-const CHARGING: Color = Color::Yellow;
+const CHARGING: Color = Color::Green;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(
-            Line::from(vec![Span::styled(
-                " 󰎈 airpods-tui ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )])
-            .alignment(Alignment::Left),
-        );
-
-    f.render_widget(outer, area);
-    let inner = shrink(area, 1, 1);
 
     if app.device_order.is_empty() {
         let msg = Paragraph::new("No device connected.\n\nWaiting…")
             .style(Style::default().fg(DIM))
             .alignment(Alignment::Center);
-        f.render_widget(msg, centered_rect(inner, 50, 30));
-        draw_footer(f, footer_row(inner), app);
+        f.render_widget(msg, centered_rect(area, 50, 30));
+        draw_footer(f, footer_row(area), app);
         return;
     }
 
-    let col = centered_col(inner, 80);
+    let col = centered_col(area, 80);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -62,7 +47,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Rename popup overlay
     if let Some(ref buf) = app.rename_mode {
-        draw_rename_popup(f, inner, buf);
+        draw_rename_popup(f, area, buf);
     }
 }
 
@@ -488,15 +473,6 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
         .alignment(Alignment::Center),
         chunks[3],
     );
-}
-
-fn shrink(area: Rect, h: u16, v: u16) -> Rect {
-    Rect {
-        x: area.x + h,
-        y: area.y + v,
-        width: area.width.saturating_sub(h * 2),
-        height: area.height.saturating_sub(v * 2),
-    }
 }
 
 fn centered_col(area: Rect, width: u16) -> Rect {

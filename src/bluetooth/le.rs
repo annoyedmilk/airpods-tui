@@ -187,62 +187,64 @@ pub async fn start_le_monitor(app_tx: UnboundedSender<AppEvent>) -> bluer::Resul
                                                 auto_connect
                                             );
                                             if auto_connect {
+                                                let real_mac = matched_airpods_mac.as_ref().unwrap();
                                                 let real_address =
-                                                    Address::from_str(&addr_str).unwrap();
+                                                    Address::from_str(real_mac).unwrap();
                                                 let mut cm = connecting_macs_clone.lock().await;
                                                 if cm.contains(&real_address) {
                                                     info!(
                                                         "Already connecting to {}, skipping duplicate attempt.",
-                                                        matched_airpods_mac.as_ref().unwrap()
+                                                        real_mac
                                                     );
                                                     return;
                                                 }
                                                 cm.insert(real_address);
+                                                drop(cm);
                                                 info!(
-                                                    "AirPods are disconnected, attempting to connect to {}",
-                                                    matched_airpods_mac.as_ref().unwrap()
+                                                    "AirPods are disconnected, attempting native bluer connect to {}",
+                                                    real_mac
                                                 );
-                                                let output =
-                                                    tokio::process::Command::new("bluetoothctl")
-                                                        .arg("connect")
-                                                        .arg(matched_airpods_mac.as_ref().unwrap())
-                                                        .output()
-                                                        .await;
-                                                match output {
-                                                    Ok(output) => {
-                                                        if output.status.success() {
-                                                            info!(
-                                                                "Successfully connected to AirPods {}",
-                                                                matched_airpods_mac
-                                                                    .as_ref()
-                                                                    .unwrap()
-                                                            );
-                                                            cm.remove(&real_address);
-                                                        } else {
-                                                            let stderr = String::from_utf8_lossy(
-                                                                &output.stderr,
-                                                            );
-                                                            info!(
-                                                                "Failed to connect to AirPods {}: {}",
-                                                                matched_airpods_mac
-                                                                    .as_ref()
-                                                                    .unwrap(),
-                                                                stderr
-                                                            );
+                                                let connect_session = match Session::new().await {
+                                                    Ok(s) => s,
+                                                    Err(e) => {
+                                                        info!("Failed to create bluer session for reconnect: {}", e);
+                                                        connecting_macs_clone.lock().await.remove(&real_address);
+                                                        return;
+                                                    }
+                                                };
+                                                let connect_adapter = match connect_session.default_adapter().await {
+                                                    Ok(a) => a,
+                                                    Err(e) => {
+                                                        info!("Failed to get adapter for reconnect: {}", e);
+                                                        connecting_macs_clone.lock().await.remove(&real_address);
+                                                        return;
+                                                    }
+                                                };
+                                                match connect_adapter.device(real_address) {
+                                                    Ok(device) => {
+                                                        match device.connect().await {
+                                                            Ok(()) => {
+                                                                info!(
+                                                                    "Successfully connected to AirPods {}",
+                                                                    real_mac
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                info!(
+                                                                    "Failed to connect to AirPods {}: {}",
+                                                                    real_mac, e
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
                                                         info!(
-                                                            "Failed to execute bluetoothctl to connect to AirPods {}: {}",
-                                                            matched_airpods_mac.as_ref().unwrap(),
-                                                            e
+                                                            "Failed to get bluer device for {}: {}",
+                                                            real_mac, e
                                                         );
                                                     }
                                                 }
-                                                info!(
-                                                    "Auto-connect is disabled for {}, not attempting to connect.",
-                                                    matched_airpods_mac.as_ref().unwrap()
-                                                );
+                                                connecting_macs_clone.lock().await.remove(&real_address);
                                             }
                                         }
 
