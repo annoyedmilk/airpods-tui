@@ -54,7 +54,7 @@ Add this to `~/.config/waybar/config.jsonc` inside the modules list:
     "exec": "airpods-tui --waybar-watch",
     "return-type": "json",
     "format": "󰎈 {}",
-    "on-click": "airpods-tui"
+    "on-click": "omarchy-launch-airpods"
 }
 ```
 

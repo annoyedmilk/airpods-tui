@@ -16,13 +16,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
-/// Parse a MAC address string (e.g. "AA:BB:CC:DD:EE:FF") into bytes.
-/// Returns None if the string is malformed.
-fn mac_to_bytes(mac: &str) -> Option<Vec<u8>> {
-    mac.split(':')
-        .map(|s| u8::from_str_radix(s, 16).ok())
-        .collect()
-}
 
 const PSM: u16 = 0x1001;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,8 +37,6 @@ pub mod opcodes {
     pub const EQ_DATA: u8 = 0x53;
     pub const CONNECTED_DEVICES: u8 = 0x2E;
     pub const AUDIO_SOURCE: u8 = 0x0E;
-    pub const SMART_ROUTING: u8 = 0x10;
-    pub const SMART_ROUTING_RESP: u8 = 0x11;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -277,7 +268,6 @@ pub struct ConnectedDevice {
     pub mac: String,
     pub info1: u8,
     pub info2: u8,
-    pub r#type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,7 +276,6 @@ pub enum AACPEvent {
     ControlCommand(ControlCommandStatus),
     EarDetection(Vec<EarDetectionStatus>, Vec<EarDetectionStatus>),
     ConversationalAwareness(u8),
-    #[allow(dead_code)]
     AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
@@ -892,12 +881,7 @@ impl AACPManager {
                     );
                     let info1 = payload[base + 6];
                     let info2 = payload[base + 7];
-                    devices.push(ConnectedDevice {
-                        mac,
-                        info1,
-                        info2,
-                        r#type: None,
-                    });
+                    devices.push(ConnectedDevice { mac, info1, info2 });
                 }
                 let mut state = self.state.lock().await;
                 state.old_connected_devices = state.connected_devices.clone();
@@ -910,14 +894,16 @@ impl AACPManager {
                 }
                 info!("Received Connected Devices: {:?}", state.connected_devices);
             }
-            opcodes::SMART_ROUTING_RESP => {
+            0x11 => {
+                // Smart-Routing response — only the OwnershipToFalse notification matters.
                 let packet_string = String::from_utf8_lossy(&payload[2..]);
-                info!("Received Smart Routing Response: {}", packet_string);
                 if packet_string.contains("SetOwnershipToFalse") {
-                    info!("Received OwnershipToFalse request");
+                    info!("Received OwnershipToFalse request via smart-routing response");
                     if let Some(ref tx) = self.state.lock().await.event_tx {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
                     }
+                } else {
+                    debug!("Smart-routing response (ignored): {}", packet_string);
                 }
             }
             opcodes::EQ_DATA => {
@@ -995,190 +981,6 @@ impl AACPManager {
             data.push(value.get(i).copied().unwrap_or(0));
         }
         let packet = [opcode.as_slice(), data.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_media_information_new_device(
-        &self,
-        self_mac_address: &str,
-        target_mac_address: &str,
-    ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(112);
-        let Some(target_mac_bytes) = mac_to_bytes(target_mac_address) else {
-            error!("Invalid MAC address: {}", target_mac_address);
-            return Ok(());
-        };
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-
-        buffer.extend_from_slice(&[0x68, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"playingApp");
-        buffer.push(0x42);
-        buffer.extend_from_slice(b"NA");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"hostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(b"NO");
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x30, 0x64]);
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(106);
-        let Some(target_mac_bytes) = mac_to_bytes(target_mac_address) else {
-            error!("Invalid MAC address: {}", target_mac_address);
-            return Ok(());
-        };
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x62, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.push(0x4A);
-        buffer.extend_from_slice(b"localscore");
-        buffer.extend_from_slice(&[0x30, 0x64]);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reason");
-        buffer.push(0x48);
-        buffer.extend_from_slice(b"Hijackv2");
-        buffer.push(0x51);
-        buffer.extend_from_slice(b"audioRoutingScore");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01, 0x5F]);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x4B);
-        buffer.extend_from_slice(b"remotescore");
-        buffer.push(0xA5);
-
-        while buffer.len() < 106 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_media_information(
-        &self,
-        self_mac_address: &str,
-        target_mac_address: &str,
-        streaming_state: bool,
-    ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(138);
-        let Some(target_mac_bytes) = mac_to_bytes(target_mac_address) else {
-            error!("Invalid MAC address: {}", target_mac_address);
-            return Ok(());
-        };
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x82, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"PlayingApp");
-        buffer.push(0x56);
-        buffer.extend_from_slice(b"com.google.ios.youtube");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"HostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-        while buffer.len() < 138 {
-            buffer.push(0x00);
-        }
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(134);
-        let Some(target_mac_bytes) = mac_to_bytes(target_mac_address) else {
-            error!("Invalid MAC address: {}", target_mac_address);
-            return Ok(());
-        };
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x7E, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
-        buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
-        buffer.push(0x01);
-        buffer.push(0x4A);
-        buffer.extend_from_slice(b"localscore");
-        buffer.extend_from_slice(&[0x31, 0x2D]);
-        buffer.push(0x01);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reasonHhijackv2");
-        buffer.push(0x51);
-        buffer.extend_from_slice(b"audioRoutingScore");
-        buffer.push(0xA2);
-        buffer.push(0x5F);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x4B);
-        buffer.extend_from_slice(b"remotescore");
-        buffer.push(0xA2);
-
-        while buffer.len() < 134 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
-    pub async fn send_add_tipi_device(
-        &self,
-        self_mac_address: &str,
-        target_mac_address: &str,
-    ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(86);
-        let Some(target_mac_bytes) = mac_to_bytes(target_mac_address) else {
-            error!("Invalid MAC address: {}", target_mac_address);
-            return Ok(());
-        };
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x4E, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.extend_from_slice(&[0x48, 0x69]);
-        buffer.extend_from_slice(b"idleTime");
-        buffer.extend_from_slice(&[0x08, 0x47]);
-        buffer.extend_from_slice(b"newTipi");
-        buffer.extend_from_slice(&[0x01, 0x49]);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x50);
-        buffer.extend_from_slice(b"nearbyAudioScore");
-        buffer.push(0x0E);
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
         self.send_data_packet(&packet).await
     }
 

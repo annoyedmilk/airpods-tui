@@ -192,39 +192,14 @@ impl AirPodsDevice {
                     }
                     AACPEvent::ConnectedDevices(old_devices, new_devices) => {
                         let local_mac = local_mac_events.clone();
-                        let new_devices_filtered = new_devices.iter().filter(|new_device| {
-                            let not_in_old = old_devices
-                                .iter()
-                                .all(|old_device| old_device.mac != new_device.mac);
-                            let not_local = new_device.mac != local_mac;
-                            not_in_old && not_local
-                        });
-
-                        for device in new_devices_filtered {
-                            info!(
-                                "New connected device: {}, info1: {}, info2: {}",
-                                device.mac, device.info1, device.info2
-                            );
-                            let aacp_manager_clone = aacp_manager_clone_events.clone();
-                            let local_mac_clone = local_mac.clone();
-                            let device_mac_clone = device.mac.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = aacp_manager_clone
-                                    .send_media_information_new_device(
-                                        &local_mac_clone,
-                                        &device_mac_clone,
-                                    )
-                                    .await
-                                {
-                                    error!("Failed to send media info new device: {}", e);
-                                }
-                                if let Err(e) = aacp_manager_clone
-                                    .send_add_tipi_device(&local_mac_clone, &device_mac_clone)
-                                    .await
-                                {
-                                    error!("Failed to send add tipi device: {}", e);
-                                }
-                            });
+                        for device in &new_devices {
+                            let is_new = old_devices.iter().all(|old| old.mac != device.mac);
+                            if is_new && device.mac != local_mac {
+                                info!(
+                                    "Peer device connected to AirPods: {} (info1={} info2={})",
+                                    device.mac, device.info1, device.info2
+                                );
+                            }
                         }
                     }
                     AACPEvent::OwnershipToFalseRequest => {
@@ -236,6 +211,16 @@ impl AirPodsDevice {
                         let controller = mc_clone.lock().await;
                         controller.pause_all_media().await;
                         controller.deactivate_a2dp_profile().await;
+                    }
+                    AACPEvent::AudioSource(source) => {
+                        debug!(
+                            "Received AudioSource event: mac={}, type={:?}",
+                            source.mac, source.r#type
+                        );
+                        let controller = mc_clone.lock().await;
+                        controller
+                            .handle_audio_source_change(source, &aacp_manager_clone_events)
+                            .await;
                     }
                     AACPEvent::StemPress(press_type, _bud) => {
                         let controller = mc_clone.lock().await;

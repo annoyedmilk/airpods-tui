@@ -1,4 +1,6 @@
 use crate::bluetooth::aacp::AACPManager;
+use crate::bluetooth::aacp::AudioSource;
+use crate::bluetooth::aacp::AudioSourceType;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::config::Config;
 use libpulse_binding::callbacks::ListResult;
@@ -508,6 +510,10 @@ struct MediaControllerState {
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
+    /// MAC of the device the AirPods last reported as the audio owner (None = no audio).
+    current_audio_source: Option<AudioSource>,
+    /// Set when Linux had active audio and another device took it; cleared on reclaim.
+    should_reclaim_on_none: bool,
     config: Config,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
     session_conn: Option<zbus::Connection>,
@@ -534,6 +540,8 @@ impl MediaControllerState {
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
+            current_audio_source: None,
+            should_reclaim_on_none: false,
             config,
             audio_tx,
             session_conn: None,
@@ -620,49 +628,31 @@ impl MediaController {
             let mut state = self.state.lock().await;
             let was_playing = state.is_playing;
             state.is_playing = is_playing;
-            let local_mac = state.local_mac.clone();
             drop(state);
 
             if !was_playing && is_playing {
-                let aacp_state = aacp_manager.state.lock().await;
-                if !aacp_state
-                    .ear_detection_status
-                    .contains(&EarDetectionStatus::InEar)
-                {
+                let ear_ok = {
+                    let aacp_state = aacp_manager.state.lock().await;
+                    aacp_state.ear_detection_status.contains(&EarDetectionStatus::InEar)
+                }; // ← aacp_state dropped; safe to re-enter aacp_manager below
+
+                if !ear_ok {
                     info!("Media playback started but buds not in ear, skipping takeover");
                     continue;
                 }
-                info!("Media playback started, taking ownership and activating a2dp");
+
+                // Disarm any pending handoff reclaim — Linux is now the active player.
+                {
+                    let mut state = self.state.lock().await;
+                    state.should_reclaim_on_none = false;
+                }
+
+                info!("Media playback started, claiming ownership and activating A2DP");
                 let _ = control_tx.send((
                     crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
                     vec![0x01],
                 ));
                 self.activate_a2dp_profile().await;
-
-                info!("already connected locally, hijacking connection by asking AirPods");
-
-                let connected_devices = aacp_state.connected_devices.clone();
-                for device in connected_devices {
-                    if device.mac != local_mac {
-                        if let Err(e) = aacp_manager
-                            .send_media_information(&local_mac, &device.mac, true)
-                            .await
-                        {
-                            error!("Failed to send media information to {}: {}", device.mac, e);
-                        }
-                        if let Err(e) = aacp_manager.send_smart_routing_show_ui(&device.mac).await {
-                            error!(
-                                "Failed to send smart routing show ui to {}: {}",
-                                device.mac, e
-                            );
-                        }
-                        if let Err(e) = aacp_manager.send_hijack_request(&device.mac).await {
-                            error!("Failed to send hijack request to {}: {}", device.mac, e);
-                        }
-                    }
-                }
-
-                debug!("completed playback takeover process");
             }
         }
     }
@@ -1001,6 +991,75 @@ impl MediaController {
             );
             let mut state = self.state.lock().await;
             state.is_playing = false;
+        }
+    }
+
+    /// React to an `AUDIO_SOURCE` packet from the AirPods (opcode `0x0E`).
+    ///
+    /// Three cases:
+    /// 1. Another device claimed audio while Linux was playing → pause and arm reclaim flag.
+    /// 2. The remote device released audio (`None`) and we had armed the flag → send
+    ///    `OwnsConnection` claim and resume local playback.
+    /// 3. Anything else (e.g. Linux's own MAC, or we weren't playing) → just update state.
+    pub async fn handle_audio_source_change(
+        &self,
+        source: AudioSource,
+        aacp_manager: &AACPManager,
+    ) {
+        // Snapshot + mutate state under a single lock, then release before doing any I/O.
+        enum Action {
+            Pause,
+            Reclaim,
+            Nothing,
+        }
+
+        let action = {
+            let mut state = self.state.lock().await;
+            let local_mac = state.local_mac.to_uppercase();
+            let source_mac = source.mac.to_uppercase();
+            let source_is_other = source_mac != local_mac;
+            let source_is_none = source.r#type == AudioSourceType::None;
+
+            if source_is_other && !source_is_none {
+                // A peer device has claimed the audio stream.
+                let had_audio = state.is_playing;
+                state.current_audio_source = Some(source);
+                if had_audio {
+                    state.should_reclaim_on_none = true;
+                }
+                Action::Pause
+            } else if source_is_none && state.should_reclaim_on_none {
+                // Peer released audio and we want it back.
+                state.current_audio_source = None;
+                state.should_reclaim_on_none = false;
+                Action::Reclaim
+            } else {
+                state.current_audio_source = if source_is_none { None } else { Some(source) };
+                Action::Nothing
+            }
+        }; // ← state lock released before any await
+
+        match action {
+            Action::Pause => {
+                info!("Audio ownership moved to peer device, pausing local media");
+                // Use self.pause() (not pause_all_media) so paused services are tracked
+                // in paused_by_app_services and self.resume() can restore them later.
+                self.pause().await;
+            }
+            Action::Reclaim => {
+                info!("Peer device released audio, reclaiming ownership");
+                if let Err(e) = aacp_manager
+                    .send_control_command(
+                        crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
+                        &[0x01],
+                    )
+                    .await
+                {
+                    error!("Failed to send OwnsConnection claim: {}", e);
+                }
+                self.resume().await;
+            }
+            Action::Nothing => {}
         }
     }
 
