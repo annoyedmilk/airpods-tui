@@ -1,4 +1,4 @@
-use crate::bluetooth::aacp::BatteryStatus;
+use crate::bluetooth::aacp::{BatteryStatus, EarDetectionStatus};
 use crate::devices::enums::AirPodsNoiseControlMode;
 use crate::tui::app::{AirPodsDeviceState, App, DeviceState, FocusedSection, SettingsItem};
 use ratatui::{
@@ -14,7 +14,6 @@ const FOCUS_COLOR: Color = Color::Green;
 const HEADER: Color = Color::Yellow;
 const FG: Color = Color::White;
 const DIM: Color = Color::DarkGray;
-const CHARGING: Color = Color::Green;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -48,6 +47,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Rename popup overlay
     if let Some(ref buf) = app.rename_mode {
         draw_rename_popup(f, area, buf);
+    }
+
+    // Device info popup
+    if app.show_info
+        && let Some(DeviceState::AirPods(state)) = app.selected_device()
+    {
+        draw_info_popup(f, area, state);
+    }
+
+    // Help overlay
+    if app.show_help {
+        draw_help_popup(f, area);
     }
 }
 
@@ -102,7 +113,7 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
         ("      ", &state.battery_headphone),
     ]
     .iter()
-    .filter_map(|(l, b)| b.as_ref().map(|(lvl, st)| (*l, *lvl, st.clone())))
+    .filter_map(|(l, b)| b.as_ref().map(|(lvl, st)| (*l, *lvl, *st)))
     .take(3)
     .collect();
 
@@ -121,7 +132,8 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
             .split(area);
 
         f.render_widget(
-            Paragraph::new(name_line(display_name)).alignment(Alignment::Center),
+            Paragraph::new(name_line(display_name, state.ear_left, state.ear_right))
+                .alignment(Alignment::Center),
             chunks[0],
         );
         draw_battery_box(f, chunks[1], &bat_entries);
@@ -144,7 +156,8 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
 
     // Name line
     f.render_widget(
-        Paragraph::new(name_line(display_name)).alignment(Alignment::Center),
+        Paragraph::new(name_line(display_name, state.ear_left, state.ear_right))
+            .alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -164,6 +177,7 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
     let st_inner = st_block.inner(chunks[3]);
     f.render_widget(st_block, chunks[3]);
     draw_settings_table(f, st_inner, &settings_items, app.section_row, st_focused);
+
 }
 
 fn draw_battery_box(f: &mut Frame, area: Rect, entries: &[(&str, u8, BatteryStatus)]) {
@@ -204,18 +218,7 @@ fn draw_noise_options(
     section_row: usize,
     focused: bool,
 ) {
-    let noise_modes: Vec<AirPodsNoiseControlMode> = if state.has_adaptive {
-        vec![
-            AirPodsNoiseControlMode::Transparency,
-            AirPodsNoiseControlMode::Adaptive,
-            AirPodsNoiseControlMode::NoiseCancellation,
-        ]
-    } else {
-        vec![
-            AirPodsNoiseControlMode::Transparency,
-            AirPodsNoiseControlMode::NoiseCancellation,
-        ]
-    };
+    let noise_modes = noise_mode_list(state.has_adaptive, state.allow_off_mode);
 
     let constraints: Vec<Constraint> = noise_modes.iter().map(|_| Constraint::Length(1)).collect();
     let rows = Layout::default()
@@ -347,14 +350,34 @@ fn section_block(title: &str, focused: bool) -> Block<'_> {
     }
 }
 
-fn name_line(display_name: &str) -> Line<'_> {
-    Line::from(vec![
+fn ear_label(s: EarDetectionStatus) -> &'static str {
+    match s {
+        EarDetectionStatus::InEar => "in",
+        EarDetectionStatus::OutOfEar => "out",
+        EarDetectionStatus::InCase => "case",
+        EarDetectionStatus::Disconnected => "off",
+    }
+}
+
+fn name_line(
+    display_name: &str,
+    ear_left: Option<EarDetectionStatus>,
+    ear_right: Option<EarDetectionStatus>,
+) -> Line<'_> {
+    let mut spans = vec![
         Span::styled(
             format!("  {} ", display_name),
             Style::default().fg(FG).add_modifier(Modifier::BOLD),
         ),
         Span::styled("● connected", Style::default().fg(Color::Green)),
-    ])
+    ];
+    if let (Some(l), Some(r)) = (ear_left, ear_right) {
+        spans.push(Span::styled(
+            format!("  L:{}  R:{}", ear_label(l), ear_label(r)),
+            Style::default().fg(DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn noise_row(label: &str, focused: bool, active: bool) -> Line<'static> {
@@ -379,22 +402,26 @@ fn noise_row(label: &str, focused: bool, active: bool) -> Line<'static> {
 
 fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'a> {
     let charging = matches!(status, BatteryStatus::Charging | BatteryStatus::InUse);
-    let color = if charging { CHARGING } else { Color::Gray };
+    let color = if charging {
+        Color::Cyan
+    } else if level > 50 {
+        Color::Green
+    } else if level >= 20 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
     let filled = (level as usize * 10 / 100).min(10);
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
-    Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("  {}", label), Style::default().fg(DIM)),
         Span::styled(format!("{}  ", bar), Style::default().fg(color)),
-        Span::styled(
-            format!("{:>3}%", level),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        if charging {
-            Span::styled("  ⚡", Style::default().fg(CHARGING))
-        } else {
-            Span::raw("")
-        },
-    ]))
+        Span::styled(format!("{:>3}%", level), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ];
+    if charging {
+        spans.push(Span::styled("  [charging]", Style::default().fg(Color::Cyan)));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -404,13 +431,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("  Tab", Style::default().fg(ACCENT)),
         Span::styled(" section", Style::default().fg(DIM)),
         Span::styled("  ↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" navigate", Style::default().fg(DIM)),
+        Span::styled(" nav", Style::default().fg(DIM)),
         Span::styled("  space", Style::default().fg(ACCENT)),
         Span::styled(" select", Style::default().fg(DIM)),
         Span::styled("  1-3", Style::default().fg(ACCENT)),
         Span::styled(" noise", Style::default().fg(DIM)),
         Span::styled("  r", Style::default().fg(ACCENT)),
         Span::styled(" rename", Style::default().fg(DIM)),
+        Span::styled("  i", Style::default().fg(ACCENT)),
+        Span::styled(" info", Style::default().fg(DIM)),
+        Span::styled("  ?", Style::default().fg(ACCENT)),
+        Span::styled(" help", Style::default().fg(DIM)),
     ];
     if app.audio_unavailable {
         spans.push(Span::styled("  PulseAudio unavailable", Style::default().fg(Color::Red)));
@@ -464,6 +495,117 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
     );
 }
 
+fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
+    let popup = centered_rect(area, 60, 70);
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Device Info ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    const SPARKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let eq_str: Option<String> = state.eq_bands.map(|bands| {
+        bands.iter().map(|&v| SPARKS[(v as usize * 7 / 100).min(7)]).collect()
+    });
+
+    let fields = [
+        ("Model",    state.model.as_deref()),
+        ("Firmware", state.firmware.as_deref()),
+        ("Hardware", state.hardware_revision.as_deref()),
+        ("Serial",   state.serial_number.as_deref()),
+        ("L Serial", state.left_serial.as_deref()),
+        ("R Serial", state.right_serial.as_deref()),
+        ("EQ",       eq_str.as_deref()),
+    ];
+
+    let rows: Vec<Row> = fields
+        .iter()
+        .filter_map(|(label, val)| {
+            val.map(|v| {
+                Row::new(vec![
+                    Line::from(Span::styled(*label, Style::default().fg(DIM))),
+                    Line::from(Span::styled(v.to_owned(), Style::default().fg(FG)))
+                        .alignment(Alignment::Right),
+                ])
+            })
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(10), Constraint::Fill(1)]),
+        inner,
+    );
+}
+
+fn draw_help_popup(f: &mut Frame, area: Rect) {
+    let popup = centered_rect_fixed(area, 54, 80);
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Help ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    const BINDINGS: &[(&str, &str)] = &[
+        ("q / Ctrl+C",   "Quit"),
+        ("Tab",          "Next section"),
+        ("Shift+Tab",    "Prev section"),
+        ("Up / Down",    "Navigate rows"),
+        ("Left / Right", "Adjust value / switch device"),
+        ("Space / Enter","Activate / toggle"),
+        ("1",            "Transparency"),
+        ("2",            "Adaptive (or NC if unavailable)"),
+        ("3",            "Noise Cancellation"),
+        ("c",            "Toggle Conversation Awareness"),
+        ("r",            "Rename device"),
+        ("i",            "Device info panel"),
+        ("?",            "This help screen  (any key to close)"),
+    ];
+
+    let rows: Vec<Row> = BINDINGS
+        .iter()
+        .map(|(key, desc)| {
+            Row::new(vec![
+                Line::from(Span::styled(*key, Style::default().fg(ACCENT))),
+                Line::from(Span::styled(*desc, Style::default().fg(FG))),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(18), Constraint::Fill(1)]),
+        inner,
+    );
+}
+
+/// Ordered list of noise control modes shown in the TUI.
+/// Order: Transparency → Adaptive (if available) → Noise Cancellation → Off (if allowed).
+/// Must match the row→mode mapping in `events::activate_noise_row`.
+pub fn noise_mode_list(has_adaptive: bool, allow_off: bool) -> Vec<AirPodsNoiseControlMode> {
+    let mut modes = vec![AirPodsNoiseControlMode::Transparency];
+    if has_adaptive {
+        modes.push(AirPodsNoiseControlMode::Adaptive);
+    }
+    modes.push(AirPodsNoiseControlMode::NoiseCancellation);
+    if allow_off {
+        modes.push(AirPodsNoiseControlMode::Off);
+    }
+    modes
+}
+
 fn centered_col(area: Rect, width: u16) -> Rect {
     let w = width.min(area.width);
     Rect {
@@ -481,6 +623,28 @@ fn footer_row(area: Rect) -> Rect {
         width: area.width,
         height: 1,
     }
+}
+
+/// Centers a popup with a fixed column width (clamped to the terminal width).
+fn centered_rect_fixed(area: Rect, width: u16, percent_y: u16) -> Rect {
+    let width = width.min(area.width);
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let h_pad = area.width.saturating_sub(width) / 2;
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(h_pad),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

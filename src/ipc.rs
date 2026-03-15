@@ -59,17 +59,27 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
         AppEvent::AACPEvent(mac, aacp_event) => {
             // For control commands / battery, replace previous of same variant per device
             use crate::bluetooth::aacp::AACPEvent as AE;
-            match aacp_event {
+            match &**aacp_event {
                 AE::BatteryInfo(_) => {
-                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, AE::BatteryInfo(_)) if m == mac));
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::BatteryInfo(_))));
                 }
                 AE::ControlCommand(cmd) => {
+                    let id = cmd.identifier;
                     snapshot.retain(|e| {
-                        !matches!(e, AppEvent::AACPEvent(m, AE::ControlCommand(c)) if m == mac && c.identifier == cmd.identifier)
+                        !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(&**ae, AE::ControlCommand(c) if c.identifier == id))
                     });
                 }
                 AE::DeviceInfo(_) => {
-                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, AE::DeviceInfo(_)) if m == mac));
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::DeviceInfo(_))));
+                }
+                AE::EarDetection(_, _) => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EarDetection(_, _))));
+                }
+                AE::ConnectedDevices(_, _) => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::ConnectedDevices(_, _))));
+                }
+                AE::EqData(_) => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EqData(_))));
                 }
                 _ => {}
             }
@@ -161,10 +171,9 @@ impl IpcServer {
                     loop {
                         match event_rx.recv().await {
                             Ok(event) => {
-                                if let Ok(json) = serde_json::to_vec(&event) {
-                                    if write_tx_clone.send(json).is_err() {
-                                        break;
-                                    }
+                                if let Ok(json) = serde_json::to_vec(&event)
+                                    && write_tx_clone.send(json).is_err() {
+                                    break;
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -176,19 +185,10 @@ impl IpcServer {
                 });
 
                 // Read commands from client
-                loop {
-                    match read_msg(&mut reader).await {
-                        Ok(data) => {
-                            match serde_json::from_slice::<(String, DeviceCommand)>(&data) {
-                                Ok(cmd) => {
-                                    let _ = cmd_tx.send(cmd);
-                                }
-                                Err(e) => {
-                                    error!("Invalid IPC command: {}", e);
-                                }
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(data) = read_msg(&mut reader).await {
+                    match serde_json::from_slice::<(String, DeviceCommand)>(&data) {
+                        Ok(cmd) => { let _ = cmd_tx.send(cmd); }
+                        Err(e) => { error!("Invalid IPC command: {}", e); }
                     }
                 }
 
@@ -242,10 +242,9 @@ pub async fn ipc_connect() -> std::io::Result<(
     // Write commands from cmd_tx → daemon
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
-            if let Ok(json) = serde_json::to_vec(&cmd) {
-                if write_msg(&mut writer, &json).await.is_err() {
-                    break;
-                }
+            if let Ok(json) = serde_json::to_vec(&cmd)
+                && write_msg(&mut writer, &json).await.is_err() {
+                break;
             }
         }
     });

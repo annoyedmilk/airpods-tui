@@ -10,6 +10,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Help overlay: any key dismisses it
+    if app.show_help {
+        app.show_help = false;
+        return;
+    }
+
     match key.code {
         // Quit
         KeyCode::Char('q') => app.should_quit = true,
@@ -46,22 +52,21 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
         // Left/Right: adjust sliders/enums in Settings, switch device tab otherwise
         KeyCode::Left => {
-            if app.focused_section == FocusedSection::Settings {
-                if let Some(item) = current_settings_item(app) {
-                    match item {
-                        SettingsItem::Slider { value, min, cmd, .. } => {
-                            let new_val = value.saturating_sub(5).max(min);
-                            send_setting(app, cmd, new_val);
-                            return;
-                        }
-                        SettingsItem::Enum { value, cmd, .. } => {
-                            if value > 0 {
-                                send_setting(app, cmd, value - 1);
-                            }
-                            return;
-                        }
-                        _ => {}
+            if app.focused_section == FocusedSection::Settings
+                && let Some(item) = current_settings_item(app) {
+                match item {
+                    SettingsItem::Slider { value, min, cmd, .. } => {
+                        let new_val = value.saturating_sub(5).max(min);
+                        send_setting(app, cmd, new_val);
+                        return;
                     }
+                    SettingsItem::Enum { value, cmd, .. } => {
+                        if value > 0 {
+                            send_setting(app, cmd, value - 1);
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
             }
             if app.selected_device_idx > 0 {
@@ -71,23 +76,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Right => {
-            if app.focused_section == FocusedSection::Settings {
-                if let Some(item) = current_settings_item(app) {
-                    match item {
-                        SettingsItem::Slider { value, max, cmd, .. } => {
-                            let new_val = (value + 5).min(max);
-                            send_setting(app, cmd, new_val);
-                            return;
-                        }
-                        SettingsItem::Enum { value, options, cmd, .. } => {
-                            let max_idx = (options.len() as u8).saturating_sub(1);
-                            if value < max_idx {
-                                send_setting(app, cmd, value + 1);
-                            }
-                            return;
-                        }
-                        _ => {}
+            if app.focused_section == FocusedSection::Settings
+                && let Some(item) = current_settings_item(app) {
+                match item {
+                    SettingsItem::Slider { value, max, cmd, .. } => {
+                        let new_val = (value + 5).min(max);
+                        send_setting(app, cmd, new_val);
+                        return;
                     }
+                    SettingsItem::Enum { value, options, cmd, .. } => {
+                        let max_idx = (options.len() as u8).saturating_sub(1);
+                        if value < max_idx {
+                            send_setting(app, cmd, value + 1);
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
             }
             if app.selected_device_idx + 1 < app.device_order.len() {
@@ -121,6 +125,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
         // Space/Enter — activate the focused row
         KeyCode::Char(' ') | KeyCode::Enter => activate_row(app),
+
+        // Device info popup
+        KeyCode::Char('i') => app.show_info = !app.show_info,
+
+        // Help overlay
+        KeyCode::Char('?') => app.show_help = true,
 
         // Enter rename mode
         KeyCode::Char('r') => {
@@ -229,19 +239,16 @@ fn activate_row(app: &mut App) {
 
 fn activate_noise_row(app: &mut App) {
     let Some(mac) = app.selected_mac().cloned() else { return };
-    let (has_anc, has_adaptive) = match app.devices.get(&mac) {
-        Some(DeviceState::AirPods(s)) => (s.has_anc, s.has_adaptive),
+    let (has_anc, has_adaptive, allow_off) = match app.devices.get(&mac) {
+        Some(DeviceState::AirPods(s)) => (s.has_anc, s.has_adaptive, s.allow_off_mode),
         _ => return,
     };
     if !has_anc { return; }
 
-    let row = app.section_row;
-    let mode = match (has_adaptive, row) {
-        (_, 0)        => AirPodsNoiseControlMode::Transparency,
-        (true, 1)     => AirPodsNoiseControlMode::Adaptive,
-        (true, 2) | _ => AirPodsNoiseControlMode::NoiseCancellation,
-    };
-    set_noise_mode(app, mode);
+    let modes = crate::tui::ui::noise_mode_list(has_adaptive, allow_off);
+    if let Some(mode) = modes.into_iter().nth(app.section_row) {
+        set_noise_mode(app, mode);
+    }
 }
 
 fn activate_settings_row(app: &mut App) {

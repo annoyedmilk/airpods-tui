@@ -12,6 +12,10 @@ pub struct Config {
     /// Optional command to restart the audio server (e.g. WirePlumber).
     /// Set to `None` (the default) to disable the automatic restart.
     pub restart_audio_server: Option<Vec<String>>,
+    /// Command to send a battery-low desktop notification.
+    /// `{}` is replaced with the component label and level, e.g. "Left battery: 18%".
+    /// Set to `[]` to disable notifications.
+    pub battery_alert_command: Vec<String>,
 }
 
 impl Default for Config {
@@ -29,6 +33,11 @@ impl Default for Config {
                 "{}".into(),
             ],
             restart_audio_server: None,
+            battery_alert_command: vec![
+                "notify-send".into(),
+                "AirPods".into(),
+                "{}".into(),
+            ],
         }
     }
 }

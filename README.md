@@ -6,12 +6,14 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 
 ## Features
 
-- Battery status (Left, Right, Case)
+- Battery status with color indicators and low-battery alerts
 - Noise control (Transparency, Adaptive, Noise Cancellation)
 - Settings: Conversation Awareness, One-Bud ANC, Personalized Volume, Volume Swipe, Press Speed, Tone Volume, and more
+- Ear detection status in header
 - Stem press media controls (play/pause, next/prev track)
 - Device renaming
 - Volume swipe synced to system volume via configurable commands
+- Auto audio rerouting to AirPods on connect
 - Waybar JSON output (`--waybar` / `--waybar-watch`)
 - Background daemon with IPC for seamless reconnection
 - Supports 26 Apple/Beats models with per-model capability detection
@@ -91,6 +93,8 @@ airpods-tui -v              # show version and exit
 | `1-3` | Noise mode shortcut |
 | `c` | Toggle Conversation Awareness |
 | `r` | Rename device |
+| `i` | Device info (firmware, serial, EQ) |
+| `?` | Help screen |
 
 ## Configuration
 
@@ -99,6 +103,7 @@ Optional config at `~/.config/airpods-tui/config.toml`:
 ```toml
 volume_osd_command = ["swayosd-client", "--output-volume", "{}"]
 volume_set_command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "{}"]
+battery_alert_command = ["notify-send", "AirPods", "{}"]
 # restart_audio_server = ["systemctl", "--user", "restart", "wireplumber"]
 ```
 

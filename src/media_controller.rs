@@ -4,7 +4,7 @@ use crate::bluetooth::aacp::AudioSourceType;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::config::Config;
 use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::context::introspect::SinkInfo;
+use libpulse_binding::context::introspect::{SinkInfo, SinkInputInfo};
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::Mainloop;
@@ -69,6 +69,14 @@ enum AudioCommand {
     IsProfileAvailable {
         card_index: u32,
         profile: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    SetDefaultSink {
+        sink_name: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    MoveAllSinkInputs {
+        sink_name: String,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
 }
@@ -170,6 +178,14 @@ fn spawn_audio_thread(
                         pa_is_profile_available(&mut mainloop, &context, card_index, &profile);
                     let _ = reply.send(result);
                 }
+                AudioCommand::SetDefaultSink { sink_name, reply } => {
+                    let result = pa_set_default_sink(&mut mainloop, &mut context, &sink_name);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::MoveAllSinkInputs { sink_name, reply } => {
+                    let result = pa_move_all_sink_inputs(&mut mainloop, &mut context, &sink_name);
+                    let _ = reply.send(result);
+                }
             }
         }
 
@@ -229,10 +245,9 @@ fn pa_is_a2dp_available(mainloop: &mut Mainloop, context: &Context, card_index: 
 fn pa_get_device_index(mainloop: &mut Mainloop, context: &Context, mac: &str) -> Option<u32> {
     let cards = pa_get_card_info_list(mainloop, context);
     for card in &cards {
-        if let Some(device_string) = card.proplist.get_str("device.string") {
-            if device_string.contains(mac) {
-                return Some(card.index);
-            }
+        if let Some(device_string) = card.proplist.get_str("device.string")
+            && device_string.contains(mac) {
+            return Some(card.index);
         }
     }
     None
@@ -248,6 +263,37 @@ fn pa_set_card_profile(
     let op = introspector.set_card_profile_by_index(card_index, profile, None);
     while op.get_state() == OperationState::Running {
         mainloop.iterate(false);
+    }
+    true
+}
+
+fn pa_set_default_sink(mainloop: &mut Mainloop, context: &mut Context, sink_name: &str) -> bool {
+    let op = context.set_default_sink(sink_name, |_| {});
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    true
+}
+
+fn pa_move_all_sink_inputs(mainloop: &mut Mainloop, context: &mut Context, sink_name: &str) -> bool {
+    let indices = Rc::new(RefCell::new(Vec::<u32>::new()));
+    let op = context.introspect().get_sink_input_info_list({
+        let indices = indices.clone();
+        move |result: ListResult<&SinkInputInfo>| {
+            if let ListResult::Item(item) = result {
+                indices.borrow_mut().push(item.index);
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    for idx in indices.borrow().iter().copied() {
+        let mut introspector = context.introspect();
+        let op = introspector.move_sink_input_by_name(idx, sink_name, None);
+        while op.get_state() == OperationState::Running {
+            mainloop.iterate(false);
+        }
     }
     true
 }
@@ -355,15 +401,12 @@ fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str
 
     if let Some(list) = sink_info_list.borrow().as_ref() {
         for sink in list {
-            if let Some(device_string) = sink.proplist.get_str("device.string") {
-                if device_string
+            if let Some(device_string) = sink.proplist.get_str("device.string")
+                && device_string
                     .to_uppercase()
                     .contains(&mac.to_uppercase())
-                {
-                    if let Some(name) = &sink.name {
-                        return Some(name.to_string());
-                    }
-                }
+                && let Some(name) = &sink.name {
+                return Some(name.to_string());
             }
             if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
                 let mac_from_path = bluez_path
@@ -372,10 +415,9 @@ fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str
                     .unwrap_or("")
                     .replace("dev_", "")
                     .replace('_', ":");
-                if mac_from_path.eq_ignore_ascii_case(mac) {
-                    if let Some(name) = &sink.name {
-                        return Some(name.to_string());
-                    }
+                if mac_from_path.eq_ignore_ascii_case(mac)
+                    && let Some(name) = &sink.name {
+                    return Some(name.to_string());
                 }
             }
         }
@@ -396,7 +438,7 @@ fn pa_is_profile_available(
         .map(|card| {
             card.profiles
                 .iter()
-                .any(|p| p.name.as_ref() == Some(&profile.to_string()))
+                .any(|p| p.name.as_deref() == Some(profile))
         })
         .unwrap_or(false)
 }
@@ -488,6 +530,30 @@ async fn audio_cmd_is_profile_available(
     let _ = tx.send(AudioCommand::IsProfileAvailable {
         card_index,
         profile: profile.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_set_default_sink(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::SetDefaultSink {
+        sink_name: sink_name.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_move_all_sink_inputs(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::MoveAllSinkInputs {
+        sink_name: sink_name.to_string(),
         reply: reply_tx,
     });
     reply_rx.await.unwrap_or(false)
@@ -675,12 +741,10 @@ impl MediaController {
                 service,
                 "/org/mpris/MediaPlayer2",
                 "org.mpris.MediaPlayer2.Player",
-            ).await {
-                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
-                    if status == "Playing" {
-                        return true;
-                    }
-                }
+            ).await
+                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
+                && status == "Playing" {
+                return true;
             }
         }
         false
@@ -874,11 +938,16 @@ impl MediaController {
         drop(state);
 
         if let Some(idx) = device_index {
-            let success = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {})).is_ok();
-            let _ = success; // unused, just keeping structure
             let ok = audio_cmd_set_card_profile(&audio_tx, idx, &preferred_profile).await;
             if ok {
                 info!("Successfully activated A2DP profile: {}", preferred_profile);
+                if let Some(sink_name) = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await {
+                    audio_cmd_set_default_sink(&audio_tx, &sink_name).await;
+                    audio_cmd_move_all_sink_inputs(&audio_tx, &sink_name).await;
+                    info!("Rerouted audio output to {}", sink_name);
+                } else {
+                    warn!("Could not find sink for MAC {} to reroute audio", mac);
+                }
             } else {
                 warn!("Failed to activate A2DP profile: {}", preferred_profile);
             }
@@ -900,16 +969,14 @@ impl MediaController {
             if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
-                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
-                    if status == "Playing" {
-                        if p.call_noreply("Pause", &()).await.is_ok() {
-                            info!("Paused playback for: {}", service);
-                            paused_services.push(service.to_string());
-                        } else {
-                            error!("Failed to pause {}", service);
-                        }
-                    }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
+                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
+                && status == "Playing" {
+                if p.call_noreply("Pause", &()).await.is_ok() {
+                    info!("Paused playback for: {}", service);
+                    paused_services.push(service.to_string());
+                } else {
+                    error!("Failed to pause {}", service);
                 }
             }
         }
@@ -933,11 +1000,10 @@ impl MediaController {
             if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
-                if p.call_noreply(method, &()).await.is_ok() {
-                    info!("{} for: {}", method, service);
-                    break;
-                }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
+                && p.call_noreply(method, &()).await.is_ok() {
+                info!("{} for: {}", method, service);
+                break;
             }
         }
     }
@@ -970,16 +1036,14 @@ impl MediaController {
             if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
-                if let Ok(status) = p.get_property::<String>("PlaybackStatus").await {
-                    if status == "Playing" {
-                        if p.call_noreply("Pause", &()).await.is_ok() {
-                            info!("Paused playback for: {}", service);
-                            paused_count += 1;
-                        } else {
-                            error!("Failed to pause {}", service);
-                        }
-                    }
+            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
+                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
+                && status == "Playing" {
+                if p.call_noreply("Pause", &()).await.is_ok() {
+                    info!("Paused playback for: {}", service);
+                    paused_count += 1;
+                } else {
+                    error!("Failed to pause {}", service);
                 }
             }
         }
@@ -1243,14 +1307,13 @@ impl MediaController {
                     let state = self.state.lock().await;
                     state.conv_original_volume
                 };
-                if let Some(orig) = original {
-                    if orig > 15 {
-                        audio_cmd_transition_volume(&audio_tx, &sink, 15).await;
-                        info!(
-                            "Conversation reduce: lowered volume to 15% (original {})",
-                            orig
-                        );
-                    }
+                if let Some(orig) = original
+                    && orig > 15 {
+                    audio_cmd_transition_volume(&audio_tx, &sink, 15).await;
+                    info!(
+                        "Conversation reduce: lowered volume to 15% (original {})",
+                        orig
+                    );
                 }
             }
             3 => {

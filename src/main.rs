@@ -95,6 +95,37 @@ async fn zbus_get_property<T: TryFrom<zbus::zvariant::OwnedValue>>(
     }
 }
 
+/// Check that /etc/bluetooth/main.conf has the Apple vendor DeviceID set.
+/// Without it the AirPods will not respond to AACP packets (no battery, no settings).
+fn check_bluetooth_config() {
+    const CONF: &str = "/etc/bluetooth/main.conf";
+    const REQUIRED: &str = "bluetooth:004C:";
+
+    let ok = std::fs::read_to_string(CONF)
+        .map(|s| s.lines().any(|l| {
+            let l = l.trim();
+            !l.starts_with('#') && l.contains(REQUIRED)
+        }))
+        .unwrap_or(false);
+
+    if !ok {
+        log::warn!(
+            "Apple DeviceID not set in {}. \
+             AirPods will not respond to AACP (no battery, no settings). \
+             Add the following line under [General] and restart bluetooth, then re-pair:\n  \
+             DeviceID = bluetooth:004C:0000:0000\n  \
+             sudo systemctl restart bluetooth",
+            CONF
+        );
+        eprintln!(
+            "\x1b[33mWARNING\x1b[0m: Apple DeviceID missing in {}.\n\
+             Add under [General]:\n  DeviceID = bluetooth:004C:0000:0000\n\
+             Then: sudo systemctl restart bluetooth  (and re-pair AirPods)",
+            CONF
+        );
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
@@ -105,9 +136,9 @@ fn main() -> io::Result<()> {
 
     let log_level = if args.debug { "debug" } else { "warn" };
     if std::env::var("RUST_LOG").is_err() {
-        unsafe {
-            std::env::set_var("RUST_LOG", log_level);
-        }
+        // SAFETY: called before any threads or async tasks are spawned,
+        // so no concurrent access to the environment can occur.
+        unsafe { std::env::set_var("RUST_LOG", log_level) };
     }
     match std::fs::OpenOptions::new()
         .create(true)
@@ -124,6 +155,8 @@ fn main() -> io::Result<()> {
             env_logger::Builder::from_default_env().init();
         }
     }
+
+    check_bluetooth_config();
 
     let config = config::Config::load();
 
@@ -147,17 +180,38 @@ fn main() -> io::Result<()> {
                 Arc::new(RwLock::new(Vec::new()));
             let ipc_server = Arc::new(ipc::IpcServer::new(snapshot.clone(), cmd_tx));
 
-            // Task: update snapshot and broadcast events to IPC clients
+            // Task: update snapshot, broadcast events, and check battery thresholds
             let ipc_server_clone = ipc_server.clone();
             let snapshot_clone = snapshot.clone();
+            let alert_cmd = config.battery_alert_command.clone();
             let mut app_rx = app_rx;
             tokio::spawn(async move {
+                let mut battery_alerted: HashMap<String, u8> = HashMap::new();
                 while let Some(event) = app_rx.recv().await {
                     {
                         let mut snap = snapshot_clone.write().await;
                         ipc::update_snapshot(&mut snap, &event);
                     }
                     ipc_server_clone.broadcast(&event);
+
+                    if let AppEvent::AACPEvent(ref mac, ref aacp_event) = event
+                        && let crate::bluetooth::aacp::AACPEvent::BatteryInfo(ref infos) = **aacp_event
+                    {
+                        for b in infos {
+                            if b.status == crate::bluetooth::aacp::BatteryStatus::NotCharging {
+                                let key = format!("{}-{:?}", mac, b.component);
+                                let threshold = if b.level <= 10 { 10u8 } else if b.level <= 20 { 20u8 } else { 0 };
+                                let prev = *battery_alerted.get(&key).unwrap_or(&100u8);
+                                if threshold > 0 && threshold < prev {
+                                    battery_alerted.insert(key, threshold);
+                                    let msg = format!("{:?} battery: {}%", b.component, b.level);
+                                    config::run_template_cmd(&alert_cmd, &msg);
+                                } else if threshold == 0 && prev < 100 {
+                                    battery_alerted.insert(key, 100);
+                                }
+                            }
+                        }
+                    }
                 }
             });
 
@@ -313,10 +367,8 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
         if json != last_json {
             println!("{}", json);
             last_json = json;
-            if !watch {
-                if matches!(app.selected_device(), Some(DeviceState::AirPods(s)) if s.battery_left.is_some() || s.battery_right.is_some()) {
-                    break;
-                }
+            if !watch && matches!(app.selected_device(), Some(DeviceState::AirPods(s)) if s.battery_left.is_some() || s.battery_right.is_some()) {
+                break;
             }
         }
 
@@ -349,63 +401,80 @@ async fn avrcp_volume_monitor(config: config::Config) {
     }
 
     let mut stream = zbus::MessageStream::from(&conn);
-    let mut prev_pct: i64 = -1;
-    let osd_cmd = config.volume_osd_command.clone();
+    // -1 = not yet seen.  First event seeds the baseline without adjusting volume.
+    let mut applied_pct: i64 = -1;
+    // Latest pct received but not yet dispatched (pending debounce).
+    let mut pending_pct: Option<i64> = None;
     let set_cmd = config.volume_set_command.clone();
 
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { continue };
+    // Debounce: a single stem swipe floods ~15 AVRCP Volume events in quick succession
+    // (one per ~9-unit step on the 0-127 scale).  Wait until the stream is quiet for
+    // DEBOUNCE_MS, then set the volume ABSOLUTELY to the final AVRCP value.
+    //
+    // Using an absolute set (volume_set_command) rather than a delta avoids double-applying
+    // the change on systems where WirePlumber already syncs AVRCP volume to the PipeWire
+    // A2DP sink.  swayosd detects the PulseAudio event and shows the OSD automatically.
+    const DEBOUNCE_MS: u64 = 200;
+    let debounce_deadline = tokio::time::sleep(Duration::MAX);
+    tokio::pin!(debounce_deadline);
 
-        // Only process signals
-        let header = msg.header();
-        if header.message_type() != zbus::message::Type::Signal {
-            continue;
-        }
-
-        let Some(path) = header.path() else { continue };
-        let path_str = path.as_str();
-        if !path_str.contains("/org/bluez/") {
-            continue;
-        }
-
-        let Some(member) = header.member() else { continue };
-        if member.as_str() != "PropertiesChanged" {
-            continue;
-        }
-
-        // Parse PropertiesChanged body: (interface, changed_props, invalidated)
-        let Ok(body) = msg.body().deserialize::<(
-            String,
-            HashMap<String, zbus::zvariant::OwnedValue>,
-            Vec<String>,
-        )>() else {
-            continue;
-        };
-
-        let (iface, changed, _) = body;
-        if iface != "org.bluez.MediaTransport1" {
-            continue;
-        }
-
-        if let Some(vol_val) = changed.get("Volume") {
-            let vol: Option<u64> = u16::try_from(vol_val).ok().map(|v| v as u64)
-                .or_else(|| u32::try_from(vol_val).ok().map(|v| v as u64))
-                .or_else(|| u8::try_from(vol_val).ok().map(|v| v as u64));
-            if let Some(vol) = vol {
-                let new_pct = ((vol as f64) / 127.0 * 100.0).round() as i64;
-                let old_pct = prev_pct;
-                prev_pct = new_pct;
-                if old_pct >= 0 {
-                    let delta = new_pct - old_pct;
-                    if delta != 0 {
-                        let arg = if delta > 0 { format!("+{}", delta) } else { format!("{}", delta) };
-                        config::run_template_cmd(&osd_cmd, &arg);
-                        info!("AVRCP volume {} → OSD delta {}%", vol, delta);
+    loop {
+        tokio::select! {
+            // Debounce timer fired — set the absolute target volume.
+            () = &mut debounce_deadline, if pending_pct.is_some() => {
+                let new_pct = pending_pct.take().unwrap();
+                if applied_pct >= 0 {
+                    if new_pct != applied_pct {
+                        // Pass a 0.0–1.0 fraction to volume_set_command (e.g. wpctl).
+                        let fraction = format!("{:.4}", new_pct as f64 / 100.0);
+                        config::run_template_cmd(&set_cmd, &fraction);
+                        info!("AVRCP volume swipe: {}% → {}%", applied_pct, new_pct);
                     }
                 } else {
-                    let frac = (vol as f64) / 127.0;
-                    config::run_template_cmd(&set_cmd, &format!("{:.2}", frac));
-                    info!("AVRCP volume {} → initial {:.0}%", vol, frac * 100.0);
+                    info!("AVRCP volume baseline: {}%", new_pct);
+                }
+                applied_pct = new_pct;
+            }
+
+            msg = stream.next() => {
+                let Some(Ok(msg)) = msg else { break };
+
+                let header = msg.header();
+                if header.message_type() != zbus::message::Type::Signal {
+                    continue;
+                }
+                let Some(path) = header.path() else { continue };
+                if !path.as_str().contains("/org/bluez/") {
+                    continue;
+                }
+                let Some(member) = header.member() else { continue };
+                if member.as_str() != "PropertiesChanged" {
+                    continue;
+                }
+
+                let Ok((iface, changed, _)) = msg.body().deserialize::<(
+                    String,
+                    HashMap<String, zbus::zvariant::OwnedValue>,
+                    Vec<String>,
+                )>() else {
+                    continue;
+                };
+                if iface != "org.bluez.MediaTransport1" {
+                    continue;
+                }
+
+                if let Some(vol_val) = changed.get("Volume") {
+                    let vol: Option<u64> = u16::try_from(vol_val).ok().map(|v| v as u64)
+                        .or_else(|| u32::try_from(vol_val).ok().map(|v| v as u64))
+                        .or_else(|| u8::try_from(vol_val).ok().map(|v| v as u64));
+                    if let Some(vol) = vol {
+                        let new_pct = ((vol as f64) / 127.0 * 100.0).round() as i64;
+                        // Update the pending target and reset the debounce window.
+                        pending_pct = Some(new_pct);
+                        debounce_deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + Duration::from_millis(DEBOUNCE_MS));
+                    }
                 }
             }
         }
@@ -516,6 +585,7 @@ fn spawn_airpods_init(
     config: config::Config,
 ) {
     let addr_str = addr.to_string();
+
     tokio::spawn(async move {
         match AirPodsDevice::new(addr, app_tx.clone(), product_id, config).await {
             Ok(airpods_device) => {
@@ -567,29 +637,28 @@ async fn bluetooth_main(
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
             let managers = dm_cmd.read().await;
-            if let Some(dm) = managers.get(&mac) {
-                if let Some(aacp) = dm.get_aacp() {
-                    match cmd {
-                        tui::app::DeviceCommand::ControlCommand(id, value) => {
-                            if let Err(e) = aacp.send_control_command(id, &value).await {
-                                log::error!("Failed to send control command: {}", e);
-                            }
+            if let Some(dm) = managers.get(&mac)
+                && let Some(aacp) = dm.get_aacp() {
+                match cmd {
+                    tui::app::DeviceCommand::ControlCommand(id, value) => {
+                        if let Err(e) = aacp.send_control_command(id, &value).await {
+                            log::error!("Failed to send control command: {}", e);
                         }
-                        tui::app::DeviceCommand::Rename(name) => {
-                            if let Err(e) = aacp.send_rename_packet(&name).await {
-                                log::error!("Failed to send rename: {}", e);
-                            }
-                            // Set BlueZ alias with retry (no disconnect — avoids iPhone reclaiming the name)
-                            if let Ok(addr) = mac.parse::<Address>()
-                                && let Ok(device) = adapter_cmd.device(addr)
-                            {
-                                for _ in 0..3 {
-                                    if device.set_alias(name.clone()).await.is_ok() {
-                                        log::info!("BlueZ alias updated to '{}'", name);
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    tui::app::DeviceCommand::Rename(name) => {
+                        if let Err(e) = aacp.send_rename_packet(&name).await {
+                            log::error!("Failed to send rename: {}", e);
+                        }
+                        // Set BlueZ alias with retry (no disconnect — avoids iPhone reclaiming the name)
+                        if let Ok(addr) = mac.parse::<Address>()
+                            && let Ok(device) = adapter_cmd.device(addr)
+                        {
+                            for _ in 0..3 {
+                                if device.set_alias(name.clone()).await.is_ok() {
+                                    log::info!("BlueZ alias updated to '{}'", name);
+                                    break;
                                 }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
                         }
                     }

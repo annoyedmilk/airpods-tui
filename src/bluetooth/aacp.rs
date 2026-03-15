@@ -3,7 +3,7 @@ use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::utils::get_devices_path;
 use bluer::{
     Address, AddressType, Error, Result,
-    l2cap::{SeqPacket, Socket, SocketAddr},
+    l2cap::{Security, SecurityLevel, SeqPacket, Socket, SocketAddr},
 };
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
-
 
 const PSM: u16 = 0x1001;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,45 +84,46 @@ pub enum ControlCommandIdentifiers {
     OwnsConnection = 0x06,
 }
 
-impl ControlCommandIdentifiers {
-    fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for ControlCommandIdentifiers {
+    type Error = ();
+    fn try_from(value: u8) -> std::result::Result<Self, ()> {
         match value {
-            0x01 => Some(Self::MicMode),
-            0x05 => Some(Self::ButtonSendMode),
-            0x12 => Some(Self::VoiceTrigger),
-            0x14 => Some(Self::SingleClickMode),
-            0x15 => Some(Self::DoubleClickMode),
-            0x16 => Some(Self::ClickHoldMode),
-            0x17 => Some(Self::DoubleClickInterval),
-            0x18 => Some(Self::ClickHoldInterval),
-            0x1A => Some(Self::ListeningModeConfigs),
-            0x1B => Some(Self::OneBudAncMode),
-            0x1C => Some(Self::CrownRotationDirection),
-            0x0D => Some(Self::ListeningMode),
-            0x1E => Some(Self::AutoAnswerMode),
-            0x1F => Some(Self::ChimeVolume),
-            0x23 => Some(Self::VolumeSwipeInterval),
-            0x24 => Some(Self::CallManagementConfig),
-            0x25 => Some(Self::VolumeSwipeMode),
-            0x26 => Some(Self::AdaptiveVolumeConfig),
-            0x27 => Some(Self::SoftwareMuteConfig),
-            0x28 => Some(Self::ConversationDetectConfig),
-            0x29 => Some(Self::Ssl),
-            0x2C => Some(Self::HearingAid),
-            0x2E => Some(Self::AutoAncStrength),
-            0x2F => Some(Self::HpsGainSwipe),
-            0x30 => Some(Self::HrmState),
-            0x31 => Some(Self::InCaseToneConfig),
-            0x32 => Some(Self::SiriMultitoneConfig),
-            0x33 => Some(Self::HearingAssistConfig),
-            0x34 => Some(Self::AllowOffOption),
-            0x39 => Some(Self::StemConfig),
-            0x35 => Some(Self::SleepDetectionConfig),
-            0x36 => Some(Self::AllowAutoConnect),
-            0x0A => Some(Self::EarDetectionConfig),
-            0x20 => Some(Self::AutomaticConnectionConfig),
-            0x06 => Some(Self::OwnsConnection),
-            _ => None,
+            0x01 => Ok(Self::MicMode),
+            0x05 => Ok(Self::ButtonSendMode),
+            0x12 => Ok(Self::VoiceTrigger),
+            0x14 => Ok(Self::SingleClickMode),
+            0x15 => Ok(Self::DoubleClickMode),
+            0x16 => Ok(Self::ClickHoldMode),
+            0x17 => Ok(Self::DoubleClickInterval),
+            0x18 => Ok(Self::ClickHoldInterval),
+            0x1A => Ok(Self::ListeningModeConfigs),
+            0x1B => Ok(Self::OneBudAncMode),
+            0x1C => Ok(Self::CrownRotationDirection),
+            0x0D => Ok(Self::ListeningMode),
+            0x1E => Ok(Self::AutoAnswerMode),
+            0x1F => Ok(Self::ChimeVolume),
+            0x23 => Ok(Self::VolumeSwipeInterval),
+            0x24 => Ok(Self::CallManagementConfig),
+            0x25 => Ok(Self::VolumeSwipeMode),
+            0x26 => Ok(Self::AdaptiveVolumeConfig),
+            0x27 => Ok(Self::SoftwareMuteConfig),
+            0x28 => Ok(Self::ConversationDetectConfig),
+            0x29 => Ok(Self::Ssl),
+            0x2C => Ok(Self::HearingAid),
+            0x2E => Ok(Self::AutoAncStrength),
+            0x2F => Ok(Self::HpsGainSwipe),
+            0x30 => Ok(Self::HrmState),
+            0x31 => Ok(Self::InCaseToneConfig),
+            0x32 => Ok(Self::SiriMultitoneConfig),
+            0x33 => Ok(Self::HearingAssistConfig),
+            0x34 => Ok(Self::AllowOffOption),
+            0x39 => Ok(Self::StemConfig),
+            0x35 => Ok(Self::SleepDetectionConfig),
+            0x36 => Ok(Self::AllowAutoConnect),
+            0x0A => Ok(Self::EarDetectionConfig),
+            0x20 => Ok(Self::AutomaticConnectionConfig),
+            0x06 => Ok(Self::OwnsConnection),
+            _ => Err(()),
         }
     }
 }
@@ -178,12 +178,13 @@ pub enum ProximityKeyType {
     EncKey = 0x04,
 }
 
-impl ProximityKeyType {
-    fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for ProximityKeyType {
+    type Error = ();
+    fn try_from(value: u8) -> std::result::Result<Self, ()> {
         match value {
-            0x01 => Some(Self::Irk),
-            0x04 => Some(Self::EncKey),
-            _ => None,
+            0x01 => Ok(Self::Irk),
+            0x04 => Ok(Self::EncKey),
+            _ => Err(()),
         }
     }
 }
@@ -191,10 +192,10 @@ impl ProximityKeyType {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 pub enum StemPressType {
-    SinglePress = 0x05,
-    DoublePress = 0x06,
-    TriplePress = 0x07,
-    LongPress = 0x08,
+    Single = 0x05,
+    Double = 0x06,
+    Triple = 0x07,
+    Long = 0x08,
 }
 
 #[repr(u8)]
@@ -239,13 +240,14 @@ pub enum EarDetectionStatus {
     Disconnected = 0x03,
 }
 
-impl AudioSourceType {
-    fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for AudioSourceType {
+    type Error = ();
+    fn try_from(value: u8) -> std::result::Result<Self, ()> {
         match value {
-            0x00 => Some(Self::None),
-            0x01 => Some(Self::Call),
-            0x02 => Some(Self::Media),
-            _ => None,
+            0x00 => Ok(Self::None),
+            0x01 => Ok(Self::Call),
+            0x02 => Ok(Self::Media),
+            _ => Err(()),
         }
     }
 }
@@ -279,8 +281,9 @@ pub enum AACPEvent {
     AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
-    DeviceInfo(crate::devices::airpods::AirPodsInformation),
+    DeviceInfo(Box<crate::devices::airpods::AirPodsInformation>),
     StemPress(StemPressType, Option<StemPressBudType>),
+    EqData([u8; 8]),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +372,17 @@ impl AACPManager {
                 return;
             }
         };
+
+        // BlueZ 5.86+ requires an explicit security level on BR/EDR L2CAP sockets.
+        // Without it the kernel accepts connect() but drops the channel before the
+        // first send, returning ENOTCONN (os error 107).
+        if let Err(e) = socket.set_security(Security {
+            level: SecurityLevel::Medium,
+            key_size: 0,
+        }) {
+            error!("Failed to set L2CAP security level: {}", e);
+            return;
+        }
 
         let seq_packet =
             match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target_sa)).await {
@@ -557,7 +571,7 @@ impl AACPManager {
                     None => vec![0],
                 };
 
-                if let Some(identifier) = ControlCommandIdentifiers::from_u8(identifier_byte) {
+                if let Ok(identifier) = ControlCommandIdentifiers::try_from(identifier_byte) {
                     let status = ControlCommandStatus {
                         identifier,
                         value: value.clone(),
@@ -681,7 +695,7 @@ impl AACPManager {
                         strings.push(s.to_string());
                     }
                 }
-                strings.remove(0);
+                if !strings.is_empty() { strings.remove(0); }
                 let info = AirPodsInformation {
                     name: strings.first().cloned().unwrap_or_default(),
                     model_number: strings.get(1).cloned().unwrap_or_default(),
@@ -721,7 +735,7 @@ impl AACPManager {
                 }
                 info!("Received Information: {:?}", info);
                 if let Some(tx) = &state.event_tx {
-                    let _ = tx.send(AACPEvent::DeviceInfo(info));
+                    let _ = tx.send(AACPEvent::DeviceInfo(Box::new(info)));
                 }
             }
 
@@ -767,7 +781,7 @@ impl AACPManager {
                 );
                 let mut state = self.state.lock().await;
                 for (key_type, key_data) in &keys {
-                    if let Some(kt) = ProximityKeyType::from_u8(*key_type)
+                    if let Ok(kt) = ProximityKeyType::try_from(*key_type)
                         && let Some(mac) = state.airpods_mac
                     {
                         let mac_str = mac.to_string();
@@ -815,10 +829,10 @@ impl AACPManager {
             }
             opcodes::STEM_PRESS => {
                 let press_type = payload.get(2).and_then(|&b| match b {
-                    0x05 => Some(StemPressType::SinglePress),
-                    0x06 => Some(StemPressType::DoublePress),
-                    0x07 => Some(StemPressType::TriplePress),
-                    0x08 => Some(StemPressType::LongPress),
+                    0x05 => Some(StemPressType::Single),
+                    0x06 => Some(StemPressType::Double),
+                    0x07 => Some(StemPressType::Triple),
+                    0x08 => Some(StemPressType::Long),
                     _ => None,
                 });
                 let bud = payload.get(3).and_then(|&b| match b {
@@ -827,10 +841,9 @@ impl AACPManager {
                     _ => None,
                 });
                 info!("Received Stem Press packet: {:?} bud={:?} raw={}", press_type, bud, hex::encode(payload));
-                if let Some(pt) = press_type {
-                    if let Some(ref tx) = self.state.lock().await.event_tx {
-                        let _ = tx.send(AACPEvent::StemPress(pt, bud));
-                    }
+                if let Some(pt) = press_type
+                    && let Some(ref tx) = self.state.lock().await.event_tx {
+                    let _ = tx.send(AACPEvent::StemPress(pt, bud));
                 }
             }
             opcodes::AUDIO_SOURCE => {
@@ -842,7 +855,7 @@ impl AACPManager {
                     "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                     payload[7], payload[6], payload[5], payload[4], payload[3], payload[2]
                 );
-                let typ = AudioSourceType::from_u8(payload[8]).unwrap_or(AudioSourceType::None);
+                let typ = AudioSourceType::try_from(payload[8]).unwrap_or(AudioSourceType::None);
                 let audio_source = AudioSource { mac, r#type: typ };
                 let mut state = self.state.lock().await;
                 state.audio_source = Some(audio_source.clone());
@@ -907,6 +920,16 @@ impl AACPManager {
                 }
             }
             opcodes::EQ_DATA => {
+                // Packet: opcode(1) pad(1) 0x84 0x00 0x02 0x02 Phone Media EQ[0..8]
+                // payload[0] = opcode, so EQ bands start at payload[8]
+                if payload.len() >= 16 {
+                    let mut bands = [0u8; 8];
+                    bands.copy_from_slice(&payload[8..16]);
+                    let state = self.state.lock().await;
+                    if let Some(ref tx) = state.event_tx {
+                        let _ = tx.send(AACPEvent::EqData(bands));
+                    }
+                }
                 debug!("Received EQ Data");
             }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
@@ -925,8 +948,7 @@ impl AACPManager {
 
     pub async fn send_set_feature_flags_packet(&self) -> Result<()> {
         let opcode = [opcodes::SET_FEATURE_FLAGS, 0x00];
-        // let data = [0xD7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let data = [0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // adaptive volume is actually useful, seeing if it works
+        let data = [0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let packet = [opcode.as_slice(), data.as_slice()].concat();
         self.send_data_packet(&packet).await
     }
@@ -951,9 +973,10 @@ impl AACPManager {
         key_types: Vec<ProximityKeyType>,
     ) -> Result<()> {
         let opcode = [opcodes::PROXIMITY_KEYS_REQ, 0x00];
-        let mut data = Vec::with_capacity(2);
-        data.push(key_types.iter().fold(0u8, |acc, kt| acc | (*kt as u8)));
-        data.push(0x00);
+        let data = vec![
+            key_types.iter().fold(0u8, |acc, kt| acc | (*kt as u8)),
+            0x00,
+        ];
         let packet = [opcode.as_slice(), data.as_slice()].concat();
         self.send_data_packet(&packet).await
     }
@@ -984,7 +1007,8 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_some_packet(&self) -> Result<()> {
+    /// Request the current SSL (audio-routing) state from the device.
+    pub async fn send_ssl_request(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
     }

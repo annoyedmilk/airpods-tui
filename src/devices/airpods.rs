@@ -59,10 +59,10 @@ impl AirPodsDevice {
                 while let Some(value) = rx_sub.recv().await {
                     let _ = app_tx_sub.send(AppEvent::AACPEvent(
                         mac_str.clone(),
-                        AACPEvent::ControlCommand(crate::bluetooth::aacp::ControlCommandStatus {
+                        Box::new(AACPEvent::ControlCommand(crate::bluetooth::aacp::ControlCommandStatus {
                             identifier: cmd_id,
                             value,
-                        }),
+                        })),
                     ));
                 }
             });
@@ -110,9 +110,9 @@ impl AirPodsDevice {
         }
         let _ = Self::wait_for_opcode(&aacp_manager, opcodes::REQUEST_NOTIFICATIONS, 500).await;
 
-        info!("sending some packet");
-        if let Err(e) = aacp_manager.send_some_packet().await {
-            error!("Failed to send some packet: {}", e);
+        info!("Sending SSL request");
+        if let Err(e) = aacp_manager.send_ssl_request().await {
+            error!("Failed to send SSL request: {}", e);
         }
 
         if crate::devices::apple_models::needs_init_ext(product_id) {
@@ -184,6 +184,10 @@ impl AirPodsDevice {
                         controller
                             .handle_ear_detection(old_status, new_status)
                             .await;
+                        let _ = app_tx_events.send(AppEvent::AACPEvent(
+                            mac_address.to_string(),
+                            Box::new(event_clone),
+                        ));
                     }
                     AACPEvent::ConversationalAwareness(status) => {
                         debug!("Received ConversationalAwareness event: {}", status);
@@ -201,6 +205,10 @@ impl AirPodsDevice {
                                 );
                             }
                         }
+                        let _ = app_tx_events.send(AppEvent::AACPEvent(
+                            mac_address.to_string(),
+                            Box::new(event_clone),
+                        ));
                     }
                     AACPEvent::OwnershipToFalseRequest => {
                         info!(
@@ -225,19 +233,19 @@ impl AirPodsDevice {
                     AACPEvent::StemPress(press_type, _bud) => {
                         let controller = mc_clone.lock().await;
                         match press_type {
-                            StemPressType::SinglePress => {
+                            StemPressType::Single => {
                                 info!("Stem single press — toggling play/pause");
                                 controller.toggle_play_pause().await;
                             }
-                            StemPressType::DoublePress => {
+                            StemPressType::Double => {
                                 info!("Stem double press — next track");
                                 controller.next_track().await;
                             }
-                            StemPressType::TriplePress => {
+                            StemPressType::Triple => {
                                 info!("Stem triple press — previous track");
                                 controller.previous_track().await;
                             }
-                            StemPressType::LongPress => {
+                            StemPressType::Long => {
                                 debug!("Stem long press — ignored");
                             }
                         }
@@ -246,7 +254,7 @@ impl AirPodsDevice {
                         debug!("Forwarding AACP event to TUI: {:?}", event_clone);
                         let _ = app_tx_events.send(AppEvent::AACPEvent(
                             mac_address.to_string(),
-                            event_clone,
+                            Box::new(event_clone),
                         ));
                     }
                 }
@@ -255,7 +263,7 @@ impl AirPodsDevice {
 
         // media_controller and mac_address are used by spawned tasks above
         // but not needed in the struct after initialization
-        let _ = media_controller;
+        drop(media_controller);
         Ok(AirPodsDevice {
             aacp_manager,
         })

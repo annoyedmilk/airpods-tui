@@ -1,4 +1,4 @@
-use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryStatus, ControlCommandIdentifiers};
+use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryStatus, ConnectedDevice, ControlCommandIdentifiers, EarDetectionStatus};
 use crate::devices::enums::AirPodsNoiseControlMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ pub enum DeviceCommand {
 pub enum AppEvent {
     DeviceConnected { mac: String, name: String, product_id: u16 },
     DeviceDisconnected(String),
-    AACPEvent(String, AACPEvent),
+    AACPEvent(String, Box<crate::bluetooth::aacp::AACPEvent>),
     AudioUnavailable,
 }
 
@@ -62,6 +62,18 @@ pub struct AirPodsDeviceState {
     pub tone_volume: Option<u8>,
     pub volume_swipe_length: Option<u8>,
     pub adaptive_noise_level: Option<u8>,
+    // Ear detection
+    pub ear_left: Option<EarDetectionStatus>,
+    pub ear_right: Option<EarDetectionStatus>,
+    // Device info extras
+    pub firmware: Option<String>,
+    pub hardware_revision: Option<String>,
+    pub left_serial: Option<String>,
+    pub right_serial: Option<String>,
+    // Peer devices
+    pub peer_devices: Vec<ConnectedDevice>,
+    // Headphone Accommodation EQ (read-only, from device)
+    pub eq_bands: Option<[u8; 8]>,
 }
 
 impl AirPodsDeviceState {
@@ -89,6 +101,14 @@ impl AirPodsDeviceState {
             tone_volume: None,
             volume_swipe_length: None,
             adaptive_noise_level: None,
+            ear_left: None,
+            ear_right: None,
+            firmware: None,
+            hardware_revision: None,
+            left_serial: None,
+            right_serial: None,
+            peer_devices: Vec::new(),
+            eq_bands: None,
         }
     }
 }
@@ -116,6 +136,8 @@ pub struct App {
     pub should_quit: bool,
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, DeviceCommand)>>,
     pub rename_mode: Option<String>,
+    pub show_help: bool,
+    pub show_info: bool,
     pub audio_unavailable: bool,
 }
 
@@ -134,6 +156,8 @@ impl App {
             should_quit: false,
             command_tx: Some(command_tx),
             rename_mode: None,
+            show_help: false,
+            show_info: false,
             audio_unavailable: false,
         }
     }
@@ -146,11 +170,12 @@ impl App {
         self.selected_mac().and_then(|mac| self.devices.get(mac))
     }
 
-    /// Number of rows in the Noise Control section
+    /// Number of rows in the Noise Control section.
+    /// Must match the length of `ui::noise_mode_list`.
     pub fn noise_control_rows(&self) -> usize {
         match self.selected_device() {
             Some(DeviceState::AirPods(s)) if s.has_anc => {
-                if s.has_adaptive { 3 } else { 2 }
+                crate::tui::ui::noise_mode_list(s.has_adaptive, s.allow_off_mode).len()
             }
             _ => 0,
         }
@@ -274,7 +299,7 @@ impl App {
                     }
                 }
                 AppEvent::AACPEvent(mac, event) => {
-                    self.handle_aacp_event(&mac, event);
+                    self.handle_aacp_event(&mac, *event);
                 }
                 AppEvent::AudioUnavailable => {
                     self.audio_unavailable = true;
@@ -293,10 +318,9 @@ impl App {
             self.device_order.push(mac_owned);
         }
 
-        if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(mac) {
-            if s.name == mac {
-                s.name = "AirPods".to_string();
-            }
+        if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(mac)
+            && s.name == mac {
+            s.name = "AirPods".to_string();
         }
 
         if let Some(DeviceState::AirPods(state)) = self.devices.get_mut(mac) {
@@ -336,11 +360,33 @@ impl App {
                     if !info.serial_number.is_empty() {
                         state.serial_number = Some(info.serial_number);
                     }
+                    if !info.version1.is_empty() {
+                        state.firmware = Some(info.version1);
+                    }
+                    if !info.hardware_revision.is_empty() {
+                        state.hardware_revision = Some(info.hardware_revision);
+                    }
+                    if !info.left_serial_number.is_empty() {
+                        state.left_serial = Some(info.left_serial_number);
+                    }
+                    if !info.right_serial_number.is_empty() {
+                        state.right_serial = Some(info.right_serial_number);
+                    }
+                }
+                AACPEvent::EarDetection(_, new_status) => {
+                    state.ear_left = new_status.first().copied();
+                    state.ear_right = new_status.get(1).copied();
+                }
+                AACPEvent::ConnectedDevices(_, new_devices) => {
+                    state.peer_devices = new_devices;
+                }
+                AACPEvent::EqData(bands) => {
+                    state.eq_bands = Some(bands);
                 }
                 AACPEvent::ControlCommand(cmd) => match cmd.identifier {
                     ControlCommandIdentifiers::ListeningMode => {
                         if let Some(byte) = cmd.value.first() {
-                            state.listening_mode = AirPodsNoiseControlMode::from_byte(byte);
+                            state.listening_mode = AirPodsNoiseControlMode::from_byte(*byte);
                         }
                     }
                     ControlCommandIdentifiers::AllowOffOption => {
