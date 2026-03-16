@@ -372,8 +372,9 @@ impl App {
                     }
                 }
                 AACPEvent::EarDetection(_, new_status) => {
-                    state.ear_left = new_status.first().copied();
-                    state.ear_right = new_status.get(1).copied();
+                    // AACP: index 0 = primary (right bud), index 1 = secondary (left bud)
+                    state.ear_right = new_status.first().copied();
+                    state.ear_left = new_status.get(1).copied();
                 }
                 AACPEvent::ConnectedDevices(_, new_devices) => {
                     state.peer_devices = new_devices;

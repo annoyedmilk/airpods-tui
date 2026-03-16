@@ -490,7 +490,23 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
 }
 
 fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
-    let popup = centered_rect(area, 70, 75);
+    let fields = [
+        ("Model",    state.model.as_deref()),
+        ("Firmware", state.firmware.as_deref()),
+        ("Hardware", state.hardware_revision.as_deref()),
+        ("Serial",   state.serial_number.as_deref()),
+        ("L Serial", state.left_serial.as_deref()),
+        ("R Serial", state.right_serial.as_deref()),
+    ];
+    let row_count = fields.iter().filter(|(_, v)| v.is_some()).count() as u16;
+    let popup_h = row_count + 2; // +2 for border
+    let popup_w = 50u16.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
     f.render_widget(ratatui::widgets::Clear, popup);
 
     let block = Block::default()
@@ -503,21 +519,6 @@ fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-
-    const SPARKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let eq_str: Option<String> = state.eq_bands.map(|bands| {
-        bands.iter().map(|&v| SPARKS[(v as usize * 7 / 100).min(7)]).collect()
-    });
-
-    let fields = [
-        ("Model",    state.model.as_deref()),
-        ("Firmware", state.firmware.as_deref()),
-        ("Hardware", state.hardware_revision.as_deref()),
-        ("Serial",   state.serial_number.as_deref()),
-        ("L Serial", state.left_serial.as_deref()),
-        ("R Serial", state.right_serial.as_deref()),
-        ("EQ",       eq_str.as_deref()),
-    ];
 
     let rows: Vec<Row> = fields
         .iter()

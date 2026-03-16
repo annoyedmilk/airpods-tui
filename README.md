@@ -93,7 +93,7 @@ airpods-tui -v              # show version and exit
 | `1-3` | Noise mode shortcut |
 | `c` | Toggle Conversation Awareness |
 | `r` | Rename device |
-| `i` | Device info (firmware, serial, EQ) |
+| `i` | Device info (model, firmware, serial) |
 
 ## Configuration
 
