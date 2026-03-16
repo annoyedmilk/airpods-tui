@@ -483,9 +483,9 @@ impl AACPManager {
             let _ = state
                 .control_command_subscribers
                 .get(&identifier)
-                .unwrap()
+                .expect("subscriber list just inserted")
                 .last()
-                .unwrap()
+                .expect("tx just pushed")
                 .send(status.value.clone());
         }
     }

@@ -390,7 +390,7 @@ fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str
                 sink_info_list
                     .borrow_mut()
                     .as_mut()
-                    .unwrap()
+                    .expect("sink_info_list initialized as Some")
                     .push(owned_item);
             }
         }

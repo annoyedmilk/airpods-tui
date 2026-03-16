@@ -136,7 +136,6 @@ pub struct App {
     pub should_quit: bool,
     pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, DeviceCommand)>>,
     pub rename_mode: Option<String>,
-    pub show_help: bool,
     pub show_info: bool,
     pub audio_unavailable: bool,
 }
@@ -156,7 +155,6 @@ impl App {
             should_quit: false,
             command_tx: Some(command_tx),
             rename_mode: None,
-            show_help: false,
             show_info: false,
             audio_unavailable: false,
         }

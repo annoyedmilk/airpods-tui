@@ -10,12 +10,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Help overlay: any key dismisses it
-    if app.show_help {
-        app.show_help = false;
-        return;
-    }
-
     match key.code {
         // Quit
         KeyCode::Char('q') => app.should_quit = true,
@@ -128,9 +122,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
         // Device info popup
         KeyCode::Char('i') => app.show_info = !app.show_info,
-
-        // Help overlay
-        KeyCode::Char('?') => app.show_help = true,
 
         // Enter rename mode
         KeyCode::Char('r') => {

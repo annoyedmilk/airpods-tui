@@ -56,10 +56,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_info_popup(f, area, state);
     }
 
-    // Help overlay
-    if app.show_help {
-        draw_help_popup(f, area);
-    }
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
@@ -428,10 +424,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled("q", Style::default().fg(ACCENT)),
         Span::styled(" quit", Style::default().fg(DIM)),
-        Span::styled("  Tab", Style::default().fg(ACCENT)),
+        Span::styled("  tab", Style::default().fg(ACCENT)),
         Span::styled(" section", Style::default().fg(DIM)),
         Span::styled("  ↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" nav", Style::default().fg(DIM)),
+        Span::styled(" navigation", Style::default().fg(DIM)),
         Span::styled("  space", Style::default().fg(ACCENT)),
         Span::styled(" select", Style::default().fg(DIM)),
         Span::styled("  1-3", Style::default().fg(ACCENT)),
@@ -440,8 +436,6 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" rename", Style::default().fg(DIM)),
         Span::styled("  i", Style::default().fg(ACCENT)),
         Span::styled(" info", Style::default().fg(DIM)),
-        Span::styled("  ?", Style::default().fg(ACCENT)),
-        Span::styled(" help", Style::default().fg(DIM)),
     ];
     if app.audio_unavailable {
         spans.push(Span::styled("  PulseAudio unavailable", Style::default().fg(Color::Red)));
@@ -496,7 +490,7 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
 }
 
 fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
-    let popup = centered_rect(area, 60, 70);
+    let popup = centered_rect(area, 70, 75);
     f.render_widget(ratatui::widgets::Clear, popup);
 
     let block = Block::default()
@@ -539,54 +533,7 @@ fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
         .collect();
 
     f.render_widget(
-        Table::new(rows, [Constraint::Length(10), Constraint::Fill(1)]),
-        inner,
-    );
-}
-
-fn draw_help_popup(f: &mut Frame, area: Rect) {
-    let popup = centered_rect_fixed(area, 54, 80);
-    f.render_widget(ratatui::widgets::Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            " Help ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    const BINDINGS: &[(&str, &str)] = &[
-        ("q / Ctrl+C",   "Quit"),
-        ("Tab",          "Next section"),
-        ("Shift+Tab",    "Prev section"),
-        ("Up / Down",    "Navigate rows"),
-        ("Left / Right", "Adjust value / switch device"),
-        ("Space / Enter","Activate / toggle"),
-        ("1",            "Transparency"),
-        ("2",            "Adaptive (or NC if unavailable)"),
-        ("3",            "Noise Cancellation"),
-        ("c",            "Toggle Conversation Awareness"),
-        ("r",            "Rename device"),
-        ("i",            "Device info panel"),
-        ("?",            "This help screen  (any key to close)"),
-    ];
-
-    let rows: Vec<Row> = BINDINGS
-        .iter()
-        .map(|(key, desc)| {
-            Row::new(vec![
-                Line::from(Span::styled(*key, Style::default().fg(ACCENT))),
-                Line::from(Span::styled(*desc, Style::default().fg(FG))),
-            ])
-        })
-        .collect();
-
-    f.render_widget(
-        Table::new(rows, [Constraint::Length(18), Constraint::Fill(1)]),
+        Table::new(rows, [Constraint::Length(12), Constraint::Fill(1)]),
         inner,
     );
 }
@@ -623,28 +570,6 @@ fn footer_row(area: Rect) -> Rect {
         width: area.width,
         height: 1,
     }
-}
-
-/// Centers a popup with a fixed column width (clamped to the terminal width).
-fn centered_rect_fixed(area: Rect, width: u16, percent_y: u16) -> Rect {
-    let width = width.min(area.width);
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    let h_pad = area.width.saturating_sub(width) / 2;
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(h_pad),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

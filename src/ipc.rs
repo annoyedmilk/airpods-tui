@@ -120,10 +120,25 @@ impl IpcServer {
     /// Run the IPC server, accepting connections on the Unix socket.
     pub async fn run(&self) -> std::io::Result<()> {
         let path = socket_path();
-        // Remove stale socket
-        let _ = std::fs::remove_file(&path);
+        // Remove stale socket — ignore NotFound, log other errors
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("Failed to remove stale socket {}: {}", path.display(), e);
+        }
 
         let listener = UnixListener::bind(&path)?;
+
+        // Restrict socket to owner-only access
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                log::warn!("Failed to set socket permissions: {}", e);
+            }
+        }
+
         info!("IPC server listening on {}", path.display());
 
         loop {
@@ -250,4 +265,48 @@ pub async fn ipc_connect() -> std::io::Result<(
     });
 
     Ok((cmd_tx, event_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_replaces_device_on_reconnect() {
+        let mut snap = Vec::new();
+        let e1 = AppEvent::DeviceConnected {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            name: "Test".into(),
+            product_id: 0x2014,
+        };
+        update_snapshot(&mut snap, &e1);
+        assert_eq!(snap.len(), 1);
+
+        let e2 = AppEvent::DeviceConnected {
+            mac: "AA:BB:CC:DD:EE:FF".into(),
+            name: "Test Renamed".into(),
+            product_id: 0x2014,
+        };
+        update_snapshot(&mut snap, &e2);
+        assert_eq!(snap.len(), 1); // replaced, not duplicated
+    }
+
+    #[test]
+    fn snapshot_disconnect_removes_device() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &AppEvent::DeviceConnected {
+                mac: "AA:BB:CC:DD:EE:FF".into(),
+                name: "T".into(),
+                product_id: 0,
+            },
+        );
+        assert_eq!(snap.len(), 1);
+        update_snapshot(
+            &mut snap,
+            &AppEvent::DeviceDisconnected("AA:BB:CC:DD:EE:FF".into()),
+        );
+        assert!(snap.is_empty());
+    }
 }

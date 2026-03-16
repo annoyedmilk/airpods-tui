@@ -52,9 +52,9 @@ async fn read_product_id(addr_str: &str) -> u16 {
     let path = format!("/org/bluez/hci0/dev_{}", addr_str.replace(':', "_"));
     let Ok(obj_path) = zbus::zvariant::ObjectPath::try_from(path.as_str()) else { return 0; };
     let Ok(proxy) = zbus::proxy::Builder::<'_, zbus::Proxy<'_>>::new(&conn)
-        .destination("org.bluez").unwrap()
-        .path(obj_path).unwrap()
-        .interface("org.bluez.Device1").unwrap()
+        .destination("org.bluez").expect("valid destination")
+        .path(obj_path).expect("valid object path")
+        .interface("org.bluez.Device1").expect("valid interface")
         .build()
         .await else { return 0; };
     let Ok(val): Result<zbus::zvariant::OwnedValue, _> = proxy.get_property("Modalias").await else { return 0; };
@@ -197,7 +197,18 @@ fn main() -> io::Result<()> {
                     if let AppEvent::AACPEvent(ref mac, ref aacp_event) = event
                         && let crate::bluetooth::aacp::AACPEvent::BatteryInfo(ref infos) = **aacp_event
                     {
+                        // Write battery env file from daemon so external consumers
+                        // (waybar, scripts) can read it without a TUI running
+                        let mut bat_left = None;
+                        let mut bat_right = None;
+                        let mut bat_case = None;
                         for b in infos {
+                            match b.component {
+                                crate::bluetooth::aacp::BatteryComponent::Left => bat_left = Some(b.level),
+                                crate::bluetooth::aacp::BatteryComponent::Right => bat_right = Some(b.level),
+                                crate::bluetooth::aacp::BatteryComponent::Case if b.status != crate::bluetooth::aacp::BatteryStatus::Disconnected => bat_case = Some(b.level),
+                                _ => {}
+                            }
                             if b.status == crate::bluetooth::aacp::BatteryStatus::NotCharging {
                                 let key = format!("{}-{:?}", mac, b.component);
                                 let threshold = if b.level <= 10 { 10u8 } else if b.level <= 20 { 20u8 } else { 0 };
@@ -211,6 +222,11 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
+                        let mut content = String::new();
+                        if let Some(l) = bat_left { content.push_str(&format!("LEFT={}\n", l)); }
+                        if let Some(r) = bat_right { content.push_str(&format!("RIGHT={}\n", r)); }
+                        if let Some(c) = bat_case { content.push_str(&format!("CASE={}\n", c)); }
+                        let _ = std::fs::write(crate::utils::runtime_dir().join("airpods-battery.env"), content);
                     }
                 }
             });
@@ -318,19 +334,36 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
 
     let config = config::Config::load();
 
-    let (app_tx, app_rx) = unbounded_channel::<AppEvent>();
-    let (cmd_tx, cmd_rx) = unbounded_channel::<(String, crate::tui::app::DeviceCommand)>();
+    // Try IPC first (like the TUI does) to avoid conflicting L2CAP connections
+    let ipc_rt = tokio::runtime::Runtime::new()?;
+    let ipc_result = ipc_rt.block_on(ipc::ipc_connect());
 
-    let device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let dm_clone = device_managers.clone();
-    let app_tx_bt = app_tx.clone();
+    let (_ipc_rt_guard, app_rx, cmd_tx) = if let Ok((ipc_cmd_tx, ipc_event_rx)) = ipc_result {
+        info!("Waybar: connected to daemon via IPC");
+        (Some(ipc_rt), ipc_event_rx, ipc_cmd_tx)
+    } else {
+        drop(ipc_rt);
+        info!("Waybar: no daemon, starting in-process Bluetooth");
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, config))
-            .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
-    });
+        let (app_tx, app_rx) = unbounded_channel::<AppEvent>();
+        let (cmd_tx, cmd_rx) = unbounded_channel::<(String, crate::tui::app::DeviceCommand)>();
+
+        let device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let dm_clone = device_managers.clone();
+        let app_tx_bt = app_tx.clone();
+
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Runtime::new() else {
+                log::error!("Failed to create Tokio runtime for waybar Bluetooth");
+                return;
+            };
+            rt.block_on(bluetooth_main(app_tx_bt, dm_clone, cmd_rx, config))
+                .unwrap_or_else(|e| log::error!("Bluetooth error: {}", e));
+        });
+
+        (None, app_rx, cmd_tx)
+    };
 
     let mut app = App::new(app_rx, cmd_tx);
     let timeout = if watch { Duration::from_secs(u64::MAX) } else { Duration::from_secs(5) };
@@ -395,7 +428,7 @@ async fn avrcp_volume_monitor(config: config::Config) {
         debug!("Failed to create DBusProxy for AVRCP volume monitor");
         return;
     };
-    if let Err(e) = proxy.add_match_rule(rule.try_into().unwrap()).await {
+    if let Err(e) = proxy.add_match_rule(rule.try_into().expect("valid match rule")).await {
         log::error!("Failed to add AVRCP match rule: {}", e);
         return;
     }
@@ -406,6 +439,7 @@ async fn avrcp_volume_monitor(config: config::Config) {
     // Latest pct received but not yet dispatched (pending debounce).
     let mut pending_pct: Option<i64> = None;
     let set_cmd = config.volume_set_command.clone();
+    let osd_cmd = config.volume_osd_command.clone();
 
     // Debounce: a single stem swipe floods ~15 AVRCP Volume events in quick succession
     // (one per ~9-unit step on the 0-127 scale).  Wait until the stream is quiet for
@@ -428,6 +462,8 @@ async fn avrcp_volume_monitor(config: config::Config) {
                         // Pass a 0.0–1.0 fraction to volume_set_command (e.g. wpctl).
                         let fraction = format!("{:.4}", new_pct as f64 / 100.0);
                         config::run_template_cmd(&set_cmd, &fraction);
+                        // Show OSD without changing volume (+0 = display only)
+                        config::run_template_cmd(&osd_cmd, "+0");
                         info!("AVRCP volume swipe: {}% → {}%", applied_pct, new_pct);
                     }
                 } else {
@@ -494,7 +530,7 @@ async fn bluez_connection_listener(
         debug!("Failed to create DBusProxy for BlueZ connection listener");
         return;
     };
-    if let Err(e) = proxy.add_match_rule(rule.try_into().unwrap()).await {
+    if let Err(e) = proxy.add_match_rule(rule.try_into().expect("valid match rule")).await {
         log::error!("Failed to add BlueZ match rule: {}", e);
         return;
     }
@@ -587,6 +623,14 @@ fn spawn_airpods_init(
     let addr_str = addr.to_string();
 
     tokio::spawn(async move {
+        // Send DeviceConnected BEFORE AACP init so that the IPC snapshot
+        // isn't wiped: update_snapshot clears all AACP events for a device
+        // when DeviceConnected arrives, so it must come first.
+        let _ = app_tx.send(AppEvent::DeviceConnected {
+            mac: addr_str.clone(),
+            name,
+            product_id,
+        });
         match AirPodsDevice::new(addr, app_tx.clone(), product_id, config).await {
             Ok(airpods_device) => {
                 let mut managers = device_managers.write().await;
@@ -595,12 +639,6 @@ fn spawn_airpods_init(
                     .entry(addr_str.clone())
                     .or_insert(dev_managers)
                     .set_aacp(airpods_device.aacp_manager);
-                drop(managers);
-                let _ = app_tx.send(AppEvent::DeviceConnected {
-                    mac: addr_str,
-                    name,
-                    product_id,
-                });
             }
             Err(e) => {
                 log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);

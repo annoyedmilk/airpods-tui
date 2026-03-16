@@ -56,3 +56,49 @@ pub fn parse_modalias(modalias: &str) -> Option<(u16, u16)> {
     let product = u16::from_str_radix(modalias.get(p_pos + 1..p_pos + 5)?, 16).ok()?;
     Some((vendor, product))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_model_airpods_pro2() {
+        let info = model_info(0x2014);
+        assert_eq!(info.name, "AirPods Pro 2");
+        assert!(info.has_anc);
+        assert!(info.has_adaptive);
+        assert!(info.has_stem_controls);
+        assert!(info.has_conversation_awareness);
+    }
+
+    #[test]
+    fn unknown_model_returns_defaults() {
+        let info = model_info(0xFFFF);
+        assert_eq!(info.name, "Apple Headphones");
+        assert!(info.has_anc);
+        assert!(!info.has_adaptive);
+    }
+
+    #[test]
+    fn parse_modalias_valid_bluetooth() {
+        let result = parse_modalias("bluetooth:v004Cp200EdB087");
+        assert_eq!(result, Some((0x004C, 0x200E)));
+    }
+
+    #[test]
+    fn parse_modalias_invalid_input() {
+        assert_eq!(parse_modalias("usb:something"), None);
+        assert_eq!(parse_modalias(""), None);
+        assert_eq!(parse_modalias("v"), None);
+    }
+
+    #[test]
+    fn needs_init_ext_known_models() {
+        assert!(needs_init_ext(0x2014)); // AirPods Pro 2
+        assert!(needs_init_ext(0x201b)); // AirPods 4 ANC
+        assert!(needs_init_ext(0x2027)); // AirPods Pro 3
+        assert!(needs_init_ext(0x2024)); // AirPods Pro USB-C
+        assert!(!needs_init_ext(0x2002)); // AirPods 1st gen
+        assert!(!needs_init_ext(0x200a)); // AirPods Max
+    }
+}

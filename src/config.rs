@@ -79,6 +79,10 @@ fn dirs_path() -> PathBuf {
 }
 
 /// Run a template command, replacing `{}` in each argument with `value`.
+///
+/// Uses `Command::new()` with an argv vector — no shell expansion occurs,
+/// so there is no shell-injection risk. The first element of `template` is
+/// executed directly as a binary path.
 pub fn run_template_cmd(template: &[String], value: &str) {
     if template.is_empty() {
         return;
@@ -90,4 +94,36 @@ pub fn run_template_cmd(template: &[String], value: &str) {
     let _ = std::process::Command::new(&args[0])
         .args(&args[1..])
         .output();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_expected_commands() {
+        let cfg = Config::default();
+        assert!(!cfg.volume_osd_command.is_empty());
+        assert!(!cfg.volume_set_command.is_empty());
+        assert!(!cfg.battery_alert_command.is_empty());
+        assert!(cfg.restart_audio_server.is_none());
+    }
+
+    #[test]
+    fn config_deserializes_from_toml() {
+        let toml_str = r#"
+volume_osd_command = ["echo", "{}"]
+volume_set_command = ["echo", "{}"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.volume_osd_command, vec!["echo", "{}"]);
+        assert_eq!(cfg.volume_set_command, vec!["echo", "{}"]);
+    }
+
+    #[test]
+    fn config_uses_defaults_for_missing_fields() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.volume_osd_command, Config::default().volume_osd_command);
+        assert_eq!(cfg.battery_alert_command, Config::default().battery_alert_command);
+    }
 }

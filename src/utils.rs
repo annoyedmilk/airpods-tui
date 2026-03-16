@@ -4,6 +4,10 @@ pub fn runtime_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(dir)
     } else {
+        log::warn!(
+            "XDG_RUNTIME_DIR not set, falling back to /tmp for runtime files. \
+             This is less secure as /tmp is world-readable."
+        );
         PathBuf::from("/tmp")
     }
 }

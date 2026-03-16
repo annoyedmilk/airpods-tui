@@ -94,7 +94,6 @@ airpods-tui -v              # show version and exit
 | `c` | Toggle Conversation Awareness |
 | `r` | Rename device |
 | `i` | Device info (firmware, serial, EQ) |
-| `?` | Help screen |
 
 ## Configuration
 
