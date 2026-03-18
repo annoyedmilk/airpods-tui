@@ -140,21 +140,9 @@ fn main() -> io::Result<()> {
         // so no concurrent access to the environment can occur.
         unsafe { std::env::set_var("RUST_LOG", log_level) };
     }
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::utils::runtime_dir().join("airpods-tui.log"))
-    {
-        Ok(log_file) => {
-            env_logger::Builder::from_default_env()
-                .target(env_logger::Target::Pipe(Box::new(log_file)))
-                .init();
-        }
-        Err(e) => {
-            eprintln!("Warning: Failed to open log file: {}, logging to stderr", e);
-            env_logger::Builder::from_default_env().init();
-        }
-    }
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stderr)
+        .init();
 
     check_bluetooth_config();
 
@@ -607,33 +595,37 @@ async fn bluez_connection_listener(
             .map(|(_, p)| p)
             .unwrap_or(0);
         info!("AirPods connected: {}, product_id=0x{:04x}, initializing", name, product_id);
-        spawn_airpods_init(addr, name, product_id, app_tx.clone(), device_managers.clone(), config.clone());
+        spawn_airpods_init(addr, name, product_id, AirPodsInitContext {
+            app_tx: app_tx.clone(),
+            device_managers: device_managers.clone(),
+            config: config.clone(),
+        });
     }
 }
 
-/// Shared AirPods initialization — used by both startup check and D-Bus listener.
+struct AirPodsInitContext {
+    app_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
+    config: config::Config,
+}
+
 fn spawn_airpods_init(
     addr: Address,
     name: String,
     product_id: u16,
-    app_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
-    device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
-    config: config::Config,
+    ctx: AirPodsInitContext,
 ) {
     let addr_str = addr.to_string();
 
     tokio::spawn(async move {
-        // Send DeviceConnected BEFORE AACP init so that the IPC snapshot
-        // isn't wiped: update_snapshot clears all AACP events for a device
-        // when DeviceConnected arrives, so it must come first.
-        let _ = app_tx.send(AppEvent::DeviceConnected {
+        let _ = ctx.app_tx.send(AppEvent::DeviceConnected {
             mac: addr_str.clone(),
             name,
             product_id,
         });
-        match AirPodsDevice::new(addr, app_tx.clone(), product_id, config).await {
+        match AirPodsDevice::new(addr, ctx.app_tx.clone(), product_id, ctx.config).await {
             Ok(airpods_device) => {
-                let mut managers = device_managers.write().await;
+                let mut managers = ctx.device_managers.write().await;
                 let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
                 managers
                     .entry(addr_str.clone())
@@ -740,7 +732,11 @@ async fn bluetooth_main(
             info!("Product ID for {}: 0x{:04x}", addr_str, product_id);
             spawn_airpods_init(
                 device.address(), name, product_id,
-                app_tx.clone(), device_managers.clone(), config.clone(),
+                AirPodsInitContext {
+                    app_tx: app_tx.clone(),
+                    device_managers: device_managers.clone(),
+                    config: config.clone(),
+                },
             );
         }
         Err(_) => {

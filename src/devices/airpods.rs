@@ -48,6 +48,7 @@ impl AirPodsDevice {
             ControlCommandIdentifiers::ChimeVolume,
             ControlCommandIdentifiers::VolumeSwipeInterval,
             ControlCommandIdentifiers::AutoAncStrength,
+            ControlCommandIdentifiers::MicMode,
         ] {
             let (tx_sub, mut rx_sub) = tokio::sync::mpsc::unbounded_channel();
             aacp_manager
@@ -175,14 +176,14 @@ impl AirPodsDevice {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
                 match event {
-                    AACPEvent::EarDetection(old_status, new_status) => {
+                    AACPEvent::EarDetection { old_left, old_right, new_left, new_right } => {
                         debug!(
-                            "Received EarDetection event: old_status={:?}, new_status={:?}",
-                            old_status, new_status
+                            "Received EarDetection event: old=({:?},{:?}), new=({:?},{:?})",
+                            old_left, old_right, new_left, new_right
                         );
                         let controller = mc_clone.lock().await;
                         controller
-                            .handle_ear_detection(old_status, new_status)
+                            .handle_ear_detection(old_left, old_right, new_left, new_right)
                             .await;
                         let _ = app_tx_events.send(AppEvent::AACPEvent(
                             mac_address.to_string(),

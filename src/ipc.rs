@@ -72,8 +72,8 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                 AE::DeviceInfo(_) => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::DeviceInfo(_))));
                 }
-                AE::EarDetection(_, _) => {
-                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EarDetection(_, _))));
+                AE::EarDetection { .. } => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EarDetection { .. })));
                 }
                 AE::ConnectedDevices(_, _) => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::ConnectedDevices(_, _))));

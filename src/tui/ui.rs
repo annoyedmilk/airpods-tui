@@ -490,13 +490,13 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
 }
 
 fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
-    let fields = [
-        ("Model",    state.model.as_deref()),
-        ("Firmware", state.firmware.as_deref()),
-        ("Hardware", state.hardware_revision.as_deref()),
-        ("Serial",   state.serial_number.as_deref()),
-        ("L Serial", state.left_serial.as_deref()),
-        ("R Serial", state.right_serial.as_deref()),
+    let fields: Vec<(&str, Option<&str>)> = vec![
+        ("Model",     state.model.as_deref()),
+        ("Firmware",  state.firmware.as_deref()),
+        ("Hardware",  state.hardware_revision.as_deref()),
+        ("Serial",    state.serial_number.as_deref()),
+        ("L Serial",  state.left_serial.as_deref()),
+        ("R Serial",  state.right_serial.as_deref()),
     ];
     let row_count = fields.iter().filter(|(_, v)| v.is_some()).count() as u16;
     let popup_h = row_count + 2; // +2 for border

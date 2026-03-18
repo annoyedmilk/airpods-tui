@@ -191,10 +191,17 @@ fn send_setting(app: &mut App, cmd: ControlCommandIdentifiers, value: u8) {
             ControlCommandIdentifiers::ChimeVolume => state.tone_volume = Some(value),
             ControlCommandIdentifiers::VolumeSwipeInterval => state.volume_swipe_length = Some(value),
             ControlCommandIdentifiers::AutoAncStrength => state.adaptive_noise_level = Some(value),
+            ControlCommandIdentifiers::MicMode => state.mic_mode = Some(value),
             _ => {}
         }
     }
-    app.send_command(&mac, cmd, vec![value]);
+    // MicMode uses 1-indexed AACP values (0x01=Left, 0x02=Right, 0x03=Auto)
+    let wire_value = if cmd == ControlCommandIdentifiers::MicMode {
+        value + 1
+    } else {
+        value
+    };
+    app.send_command(&mac, cmd, vec![wire_value]);
 }
 
 fn set_noise_mode(app: &mut App, mode: AirPodsNoiseControlMode) {

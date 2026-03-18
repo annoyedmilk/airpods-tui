@@ -62,6 +62,7 @@ pub struct AirPodsDeviceState {
     pub tone_volume: Option<u8>,
     pub volume_swipe_length: Option<u8>,
     pub adaptive_noise_level: Option<u8>,
+    pub mic_mode: Option<u8>,
     // Ear detection
     pub ear_left: Option<EarDetectionStatus>,
     pub ear_right: Option<EarDetectionStatus>,
@@ -101,6 +102,7 @@ impl AirPodsDeviceState {
             tone_volume: None,
             volume_swipe_length: None,
             adaptive_noise_level: None,
+            mic_mode: None,
             ear_left: None,
             ear_right: None,
             firmware: None,
@@ -250,6 +252,12 @@ impl App {
                 cmd: ControlCommandIdentifiers::AutoAncStrength,
             });
         }
+        items.push(SettingsItem::Enum {
+            label: "Mic Mode",
+            value: s.mic_mode.unwrap_or(2),
+            options: &["Always Left", "Always Right", "Automatic"],
+            cmd: ControlCommandIdentifiers::MicMode,
+        });
         items.push(SettingsItem::Toggle {
             label: "Auto Connect",
             value: s.auto_connect.unwrap_or(true),
@@ -371,10 +379,9 @@ impl App {
                         state.right_serial = Some(info.right_serial_number);
                     }
                 }
-                AACPEvent::EarDetection(_, new_status) => {
-                    // AACP: index 0 = primary (right bud), index 1 = secondary (left bud)
-                    state.ear_right = new_status.first().copied();
-                    state.ear_left = new_status.get(1).copied();
+                AACPEvent::EarDetection { new_left, new_right, .. } => {
+                    state.ear_left = new_left;
+                    state.ear_right = new_right;
                 }
                 AACPEvent::ConnectedDevices(_, new_devices) => {
                     state.peer_devices = new_devices;
@@ -441,6 +448,13 @@ impl App {
                     ControlCommandIdentifiers::AutoAncStrength => {
                         if let Some(byte) = cmd.value.first() {
                             state.adaptive_noise_level = Some(*byte);
+                        }
+                    }
+                    ControlCommandIdentifiers::MicMode => {
+                        if let Some(byte) = cmd.value.first() {
+                            // AACP uses 1-indexed (0x01=Left, 0x02=Right, 0x03=Auto)
+                            // We store 0-indexed for the Enum widget
+                            state.mic_mode = Some(byte.saturating_sub(1));
                         }
                     }
                     _ => {}

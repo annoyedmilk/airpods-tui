@@ -29,7 +29,7 @@ pub mod opcodes {
     pub const EAR_DETECTION: u8 = 0x06;
     pub const CONVERSATION_AWARENESS: u8 = 0x4B;
     pub const INFORMATION: u8 = 0x1D;
-    pub const RENAME: u8 = 0x1E;
+    pub const RENAME: u8 = 0x1A;
     pub const PROXIMITY_KEYS_REQ: u8 = 0x30;
     pub const PROXIMITY_KEYS_RSP: u8 = 0x31;
     pub const STEM_PRESS: u8 = 0x19;
@@ -276,7 +276,12 @@ pub struct ConnectedDevice {
 pub enum AACPEvent {
     BatteryInfo(Vec<BatteryInfo>),
     ControlCommand(ControlCommandStatus),
-    EarDetection(Vec<EarDetectionStatus>, Vec<EarDetectionStatus>),
+    EarDetection {
+        old_left: Option<EarDetectionStatus>,
+        old_right: Option<EarDetectionStatus>,
+        new_left: Option<EarDetectionStatus>,
+        new_right: Option<EarDetectionStatus>,
+    },
     ConversationalAwareness(u8),
     AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
@@ -303,8 +308,9 @@ pub struct AACPManagerState {
     pub audio_source: Option<AudioSource>,
     pub battery_info: Vec<BatteryInfo>,
     pub conversational_awareness_status: u8,
-    pub old_ear_detection_status: Vec<EarDetectionStatus>,
-    pub ear_detection_status: Vec<EarDetectionStatus>,
+    pub ear_detection_left: Option<EarDetectionStatus>,
+    pub ear_detection_right: Option<EarDetectionStatus>,
+    pub primary_pod: Option<BatteryComponent>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
@@ -331,8 +337,9 @@ impl AACPManagerState {
             audio_source: None,
             battery_info: Vec::new(),
             conversational_awareness_status: 0,
-            old_ear_detection_status: Vec::new(),
-            ear_detection_status: Vec::new(),
+            ear_detection_left: None,
+            ear_detection_right: None,
+            primary_pod: None,
             event_tx: None,
             devices,
             airpods_mac: None,
@@ -550,12 +557,28 @@ impl AACPManager {
                         },
                     });
                 }
+                let primary = batteries
+                    .iter()
+                    .find(|b| {
+                        matches!(
+                            b.component,
+                            BatteryComponent::Left | BatteryComponent::Right
+                        )
+                    })
+                    .map(|b| b.component);
+
                 let mut state = self.state.lock().await;
                 state.battery_info = batteries.clone();
+                if let Some(p) = primary {
+                    state.primary_pod = Some(p);
+                }
                 if let Some(ref tx) = state.event_tx {
                     let _ = tx.send(AACPEvent::BatteryInfo(batteries));
                 }
-                info!("Received Battery Info: {:?}", state.battery_info);
+                info!(
+                    "Received Battery Info: {:?} (primary_pod={:?})",
+                    state.battery_info, state.primary_pod
+                );
             }
             opcodes::CONTROL_COMMAND => {
                 if payload.len() < 7 {
@@ -612,45 +635,47 @@ impl AACPManager {
             opcodes::EAR_DETECTION => {
                 let primary_status = packet[6];
                 let secondary_status = packet[7];
-                let mut statuses = Vec::new();
-                statuses.push(match primary_status {
+
+                let parse_status = |b: u8| match b {
                     0x00 => EarDetectionStatus::InEar,
                     0x01 => EarDetectionStatus::OutOfEar,
                     0x02 => EarDetectionStatus::InCase,
                     0x03 => EarDetectionStatus::Disconnected,
                     _ => {
-                        error!("Unknown ear detection status: {:#04x}", primary_status);
+                        error!("Unknown ear detection status: {:#04x}", b);
                         EarDetectionStatus::OutOfEar
                     }
-                });
-                statuses.push(match secondary_status {
-                    0x00 => EarDetectionStatus::InEar,
-                    0x01 => EarDetectionStatus::OutOfEar,
-                    0x02 => EarDetectionStatus::InCase,
-                    0x03 => EarDetectionStatus::Disconnected,
-                    _ => {
-                        error!("Unknown ear detection status: {:#04x}", secondary_status);
-                        EarDetectionStatus::OutOfEar
-                    }
-                });
+                };
+                let ps = parse_status(primary_status);
+                let ss = parse_status(secondary_status);
+
                 let mut state = self.state.lock().await;
-                state.old_ear_detection_status = state.ear_detection_status.clone();
-                state.ear_detection_status = statuses.clone();
+                let right_is_primary =
+                    state.primary_pod == Some(BatteryComponent::Right);
+                let (left, right) = if right_is_primary {
+                    (ss, ps) // index 0 = right, index 1 = left
+                } else {
+                    (ps, ss) // index 0 = left, index 1 = right
+                };
+
+                info!(
+                    "Ear Detection: raw=[{:#04x},{:#04x}] right_is_primary={} → L={:?} R={:?}",
+                    primary_status, secondary_status, right_is_primary, left, right
+                );
+
+                let old_left = state.ear_detection_left;
+                let old_right = state.ear_detection_right;
+                state.ear_detection_left = Some(left);
+                state.ear_detection_right = Some(right);
 
                 if let Some(ref tx) = state.event_tx {
-                    debug!(
-                        "Sending Ear Detection event: old: {:?}, new: {:?}",
-                        state.old_ear_detection_status, statuses
-                    );
-                    let _ = tx.send(AACPEvent::EarDetection(
-                        state.old_ear_detection_status.clone(),
-                        statuses,
-                    ));
+                    let _ = tx.send(AACPEvent::EarDetection {
+                        old_left,
+                        old_right,
+                        new_left: Some(left),
+                        new_right: Some(right),
+                    });
                 }
-                info!(
-                    "Received Ear Detection Status: {:?}",
-                    state.ear_detection_status
-                );
             }
             opcodes::CONVERSATION_AWARENESS => {
                 if packet.len() == 10 {
@@ -782,35 +807,22 @@ impl AACPManager {
                 let mut state = self.state.lock().await;
                 for (key_type, key_data) in &keys {
                     if let Ok(kt) = ProximityKeyType::try_from(*key_type)
-                        && let Some(mac) = state.airpods_mac
-                    {
-                        let mac_str = mac.to_string();
-                        let device_data =
-                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                name: mac_str.clone(),
-                                type_: DeviceType::AirPods,
-                                information: None,
-                            });
-                        match kt {
-                            ProximityKeyType::Irk => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
+                        && let Some(mac) = state.airpods_mac {
+                            let mac_str = mac.to_string();
+                            let device_data =
+                                state.devices.entry(mac_str.clone()).or_insert(DeviceData {
+                                    name: mac_str.clone(),
+                                    type_: DeviceType::AirPods,
+                                    information: None,
+                                });
+                            match kt {
+                                ProximityKeyType::Irk => if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
                                     info.le_keys.irk = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!("Device information is not AirPods for adding LE IRK.");
-                                }
-                            },
-                            ProximityKeyType::EncKey => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
+                                },
+                                ProximityKeyType::EncKey => if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
                                     info.le_keys.enc_key = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!(
-                                        "Device information is not AirPods for adding LE encryption key."
-                                    );
-                                }
-                            },
-                        }
+                                },
+                            }
                     }
                 }
                 let Ok(json) = serde_json::to_string(&state.devices) else {
@@ -984,9 +996,10 @@ impl AACPManager {
     pub async fn send_rename_packet(&self, name: &str) -> Result<()> {
         let name_bytes = name.as_bytes();
         let size = name_bytes.len();
-        let mut packet = Vec::with_capacity(5 + size);
+        let mut packet = Vec::with_capacity(6 + size);
         packet.push(opcodes::RENAME);
         packet.push(0x00);
+        packet.push(0x01);
         packet.push(size as u8);
         packet.push(0x00);
         packet.extend_from_slice(name_bytes);

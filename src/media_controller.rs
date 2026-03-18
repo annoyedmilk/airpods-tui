@@ -699,7 +699,8 @@ impl MediaController {
             if !was_playing && is_playing {
                 let ear_ok = {
                     let aacp_state = aacp_manager.state.lock().await;
-                    aacp_state.ear_detection_status.contains(&EarDetectionStatus::InEar)
+                    aacp_state.ear_detection_left == Some(EarDetectionStatus::InEar)
+                        || aacp_state.ear_detection_right == Some(EarDetectionStatus::InEar)
                 }; // ← aacp_state dropped; safe to re-enter aacp_manager below
 
                 if !ear_ok {
@@ -756,13 +757,20 @@ impl MediaController {
 
     pub async fn handle_ear_detection(
         &self,
-        old_statuses: Vec<EarDetectionStatus>,
-        new_statuses: Vec<EarDetectionStatus>,
+        old_left: Option<EarDetectionStatus>,
+        old_right: Option<EarDetectionStatus>,
+        new_left: Option<EarDetectionStatus>,
+        new_right: Option<EarDetectionStatus>,
     ) {
         debug!(
-            "Entering handle_ear_detection with old_statuses: {:?}, new_statuses: {:?}",
-            old_statuses, new_statuses
+            "Entering handle_ear_detection with old=({:?},{:?}), new=({:?},{:?})",
+            old_left, old_right, new_left, new_right
         );
+
+        let old_statuses: Vec<EarDetectionStatus> =
+            [old_left, old_right].into_iter().flatten().collect();
+        let new_statuses: Vec<EarDetectionStatus> =
+            [new_left, new_right].into_iter().flatten().collect();
 
         let old_in_ear_data: Vec<bool> = old_statuses
             .iter()
@@ -1340,7 +1348,7 @@ impl MediaController {
                     audio_cmd_transition_volume(&audio_tx, &sink, target).await;
                 }
             }
-            4 | 6 | 7 => {
+            4 | 6 | 7 | 8 | 9 => {
                 #[allow(unused_assignments)]
                 let mut maybe_original = None;
                 {
