@@ -6,7 +6,7 @@ pkgdesc="Terminal UI for managing AirPods on Linux over Bluetooth AACP"
 arch=('x86_64')
 url="https://github.com/annoyedmilk/airpods-tui"
 license=('GPL-3.0-or-later')
-depends=('bluez' 'dbus')
+depends=('bluez' 'dbus' 'libpulse')
 makedepends=('cargo' 'git')
 optdepends=(
     'pipewire: audio routing'
