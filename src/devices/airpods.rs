@@ -21,6 +21,7 @@ impl AirPodsDevice {
         app_tx: UnboundedSender<AppEvent>,
         product_id: u16,
         config: Config,
+        reconnect_tx: Option<tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>>,
     ) -> Result<Self, bluer::Error> {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -172,6 +173,7 @@ impl AirPodsDevice {
         let local_mac_events = local_mac.clone();
         let app_tx_events = app_tx.clone();
         let command_tx_clone = command_tx.clone();
+        let reconnect_tx_clone = reconnect_tx;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
@@ -230,6 +232,19 @@ impl AirPodsDevice {
                         controller
                             .handle_audio_source_change(source, &aacp_manager_clone_events)
                             .await;
+                    }
+                    AACPEvent::ConnectionLost => {
+                        info!("AACP L2CAP connection lost for {}", mac_address);
+                        // Request reconnect from bluetooth_main (if running in-process)
+                        if let Some(ref rtx) = reconnect_tx_clone {
+                            let name = {
+                                // Try to get the current device name from the TUI state
+                                // Fall back to "AirPods" if unavailable
+                                "AirPods".to_string()
+                            };
+                            let _ = rtx.send((mac_address, name, product_id));
+                        }
+                        break; // Exit event loop — this AirPodsDevice is dead
                     }
                     AACPEvent::StemPress(press_type, _bud) => {
                         let controller = mc_clone.lock().await;

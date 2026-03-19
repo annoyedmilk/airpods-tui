@@ -289,6 +289,8 @@ pub enum AACPEvent {
     DeviceInfo(Box<crate::devices::airpods::AirPodsInformation>),
     StemPress(StemPressType, Option<StemPressBudType>),
     EqData([u8; 8]),
+    /// L2CAP connection dropped (read error or remote close).
+    ConnectionLost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +465,10 @@ impl AACPManager {
     async fn send_data_packet(&self, data: &[u8]) -> Result<()> {
         let packet = [HEADER_BYTES.as_slice(), data].concat();
         self.send_packet(&packet).await
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.state.lock().await.sender.is_some()
     }
 
     pub async fn set_event_channel(&self, tx: mpsc::UnboundedSender<AACPEvent>) {
@@ -1055,6 +1061,10 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     }
     let mut state = manager.state.lock().await;
     state.sender = None;
+    // Notify listeners that the L2CAP connection is gone so they can trigger reconnect
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(AACPEvent::ConnectionLost);
+    }
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {

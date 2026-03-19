@@ -30,6 +30,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::unbounded_channel;
 
+/// AACP service UUID used by AirPods for battery/settings communication.
+const AIRPODS_AACP_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
+
 #[derive(Parser)]
 #[command(name = "airpods-tui", about = "AirPods TUI controls for Linux")]
 struct Args {
@@ -50,16 +53,9 @@ async fn read_product_id(addr_str: &str) -> u16 {
     use crate::devices::apple_models::{APPLE_VENDOR_ID, parse_modalias};
     let Ok(conn) = zbus::Connection::system().await else { return 0; };
     let path = format!("/org/bluez/hci0/dev_{}", addr_str.replace(':', "_"));
-    let Ok(obj_path) = zbus::zvariant::ObjectPath::try_from(path.as_str()) else { return 0; };
-    let Ok(proxy) = zbus::proxy::Builder::<'_, zbus::Proxy<'_>>::new(&conn)
-        .destination("org.bluez").expect("valid destination")
-        .path(obj_path).expect("valid object path")
-        .interface("org.bluez.Device1").expect("valid interface")
-        .build()
-        .await else { return 0; };
-    let Ok(val): Result<zbus::zvariant::OwnedValue, _> = proxy.get_property("Modalias").await else { return 0; };
-    let Ok(modalias) = String::try_from(val) else { return 0; };
-    parse_modalias(&modalias)
+    zbus_get_property::<String>(&conn, &path, "org.bluez.Device1", "Modalias")
+        .await
+        .and_then(|m| parse_modalias(&m))
         .filter(|(v, _)| *v == APPLE_VENDOR_ID)
         .map(|(_, p)| p)
         .unwrap_or(0)
@@ -135,12 +131,7 @@ fn main() -> io::Result<()> {
     }
 
     let log_level = if args.debug { "debug" } else { "warn" };
-    if std::env::var("RUST_LOG").is_err() {
-        // SAFETY: called before any threads or async tasks are spawned,
-        // so no concurrent access to the environment can occur.
-        unsafe { std::env::set_var("RUST_LOG", log_level) };
-    }
-    env_logger::Builder::from_default_env()
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
         .target(env_logger::Target::Stderr)
         .init();
 
@@ -210,11 +201,7 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
-                        let mut content = String::new();
-                        if let Some(l) = bat_left { content.push_str(&format!("LEFT={}\n", l)); }
-                        if let Some(r) = bat_right { content.push_str(&format!("RIGHT={}\n", r)); }
-                        if let Some(c) = bat_case { content.push_str(&format!("CASE={}\n", c)); }
-                        let _ = std::fs::write(crate::utils::runtime_dir().join("airpods-battery.env"), content);
+                        crate::utils::write_battery_env(bat_left, bat_right, bat_case);
                     }
                 }
             });
@@ -354,12 +341,35 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
     };
 
     let mut app = App::new(app_rx, cmd_tx);
-    let timeout = if watch { Duration::from_secs(u64::MAX) } else { Duration::from_secs(5) };
-    let start = std::time::Instant::now();
+    let deadline = if watch { None } else { Some(std::time::Instant::now() + Duration::from_secs(5)) };
     let mut last_json = String::new();
 
     loop {
-        app.process_events();
+        // Block until an event arrives or timeout expires (avoids busy-wait polling)
+        let remaining = match deadline {
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d { break; }
+                d - now
+            }
+            None => Duration::from_secs(60),
+        };
+        // blocking_recv with a timeout via std::sync::mpsc isn't available on tokio unbounded,
+        // so we use a short poll to stay responsive while avoiding the 200ms busy-wait
+        match app.rx.try_recv() {
+            Ok(event) => {
+                // Process this event plus any others that have queued up
+                app.handle_event(event);
+                while let Ok(event) = app.rx.try_recv() {
+                    app.handle_event(event);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // No event available — sleep for a reasonable interval
+                std::thread::sleep(remaining.min(Duration::from_secs(1)));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
 
         let json = match app.selected_device() {
             Some(DeviceState::AirPods(s)) => {
@@ -392,12 +402,6 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
                 break;
             }
         }
-
-        if !watch && start.elapsed() >= timeout {
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(200));
     }
 
     Ok(())
@@ -512,6 +516,7 @@ async fn bluez_connection_listener(
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     devices_list: HashMap<String, DeviceData>,
     config: config::Config,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>,
 ) {
     let rule = "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
     let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
@@ -564,7 +569,9 @@ async fn bluez_connection_listener(
         };
 
         if !is_connected {
-            let _ = app_tx.send(AppEvent::DeviceDisconnected(addr_str));
+            if let Err(e) = app_tx.send(AppEvent::DeviceDisconnected(addr_str.clone())) {
+                debug!("Failed to send DeviceDisconnected for {}: {}", addr_str, e);
+            }
             continue;
         }
 
@@ -575,8 +582,7 @@ async fn bluez_connection_listener(
         // AirPods: check UUID
         let uuids: Option<Vec<String>> = zbus_get_property(&conn, &path_str, "org.bluez.Device1", "UUIDs").await;
         let Some(uuids) = uuids else { continue };
-        let target_uuid = "74ec2172-0bad-4d01-8f77-997b2be0722a";
-        if !uuids.iter().any(|u| u.to_lowercase() == target_uuid) {
+        if !uuids.iter().any(|u| u.to_lowercase() == AIRPODS_AACP_UUID) {
             continue;
         }
 
@@ -599,6 +605,7 @@ async fn bluez_connection_listener(
             app_tx: app_tx.clone(),
             device_managers: device_managers.clone(),
             config: config.clone(),
+            reconnect_tx: reconnect_tx.clone(),
         });
     }
 }
@@ -607,6 +614,7 @@ struct AirPodsInitContext {
     app_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     config: config::Config,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>,
 }
 
 fn spawn_airpods_init(
@@ -618,12 +626,24 @@ fn spawn_airpods_init(
     let addr_str = addr.to_string();
 
     tokio::spawn(async move {
-        let _ = ctx.app_tx.send(AppEvent::DeviceConnected {
+        // Dedup: if another init already established a live connection, skip
+        {
+            let managers = ctx.device_managers.read().await;
+            if let Some(dm) = managers.get(&addr_str)
+                && dm.get_aacp().is_connected().await
+            {
+                info!("Skipping init for {} — AACP already connected", addr_str);
+                return;
+            }
+        }
+        if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
             mac: addr_str.clone(),
             name,
             product_id,
-        });
-        match AirPodsDevice::new(addr, ctx.app_tx.clone(), product_id, ctx.config).await {
+        }) {
+            log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
+        }
+        match AirPodsDevice::new(addr, ctx.app_tx.clone(), product_id, ctx.config, Some(ctx.reconnect_tx)).await {
             Ok(airpods_device) => {
                 let mut managers = ctx.device_managers.write().await;
                 let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
@@ -667,8 +687,8 @@ async fn bluetooth_main(
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
             let managers = dm_cmd.read().await;
-            if let Some(dm) = managers.get(&mac)
-                && let Some(aacp) = dm.get_aacp() {
+            if let Some(dm) = managers.get(&mac) {
+                let aacp = dm.get_aacp();
                 match cmd {
                     tui::app::DeviceCommand::ControlCommand(id, value) => {
                         if let Err(e) = aacp.send_control_command(id, &value).await {
@@ -697,6 +717,38 @@ async fn bluetooth_main(
         }
     });
 
+    // Reconnect channel: when L2CAP drops but BlueZ still reports Connected,
+    // airpods.rs sends (addr, name, product_id) here to trigger re-initialization.
+    let (reconnect_tx, mut reconnect_rx) = unbounded_channel::<(Address, String, u16)>();
+    {
+        let app_tx = app_tx.clone();
+        let dm = device_managers.clone();
+        let cfg = config.clone();
+        let reconnect_tx = reconnect_tx.clone();
+        let dl = devices_list.clone();
+        tokio::spawn(async move {
+            while let Some((addr, _name, product_id)) = reconnect_rx.recv().await {
+                let addr_str = addr.to_string();
+                // Re-read the name from BlueZ (may have been renamed)
+                let name = dl
+                    .get(&addr_str)
+                    .filter(|d| !d.name.is_empty())
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "AirPods".to_string());
+                info!("AACP reconnect: {} ({}), waiting 2s before retry", name, addr);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Remove stale manager before reinit
+                dm.write().await.remove(&addr_str);
+                spawn_airpods_init(addr, name, product_id, AirPodsInitContext {
+                    app_tx: app_tx.clone(),
+                    device_managers: dm.clone(),
+                    config: cfg.clone(),
+                    reconnect_tx: reconnect_tx.clone(),
+                });
+            }
+        });
+    }
+
     // Start D-Bus listener FIRST to avoid missing connections during startup checks
     info!("Listening for Bluetooth connections via D-Bus...");
     let conn = zbus::Connection::system().await.map_err(|e| bluer::Error {
@@ -708,8 +760,9 @@ async fn bluetooth_main(
         let dm = device_managers.clone();
         let dl = devices_list.clone();
         let cfg = config.clone();
+        let rtx = reconnect_tx.clone();
         tokio::spawn(async move {
-            bluez_connection_listener(conn, app_tx, dm, dl, cfg).await;
+            bluez_connection_listener(conn, app_tx, dm, dl, cfg, rtx).await;
         })
     };
 
@@ -736,6 +789,7 @@ async fn bluetooth_main(
                     app_tx: app_tx.clone(),
                     device_managers: device_managers.clone(),
                     config: config.clone(),
+                    reconnect_tx: reconnect_tx.clone(),
                 },
             );
         }

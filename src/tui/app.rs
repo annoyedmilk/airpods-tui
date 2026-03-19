@@ -266,51 +266,56 @@ impl App {
         items
     }
 
+    /// Handle a single AppEvent and update state.
+    pub fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::DeviceConnected { mac, name, product_id } => {
+                if self.devices.contains_key(&mac) {
+                    if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(&mac) {
+                        s.name = name;
+                        // Fix race: AACP events may arrive before DeviceConnected,
+                        // so update product_id and model info now
+                        if product_id != 0 && s.product_id == 0 {
+                            let info = crate::devices::apple_models::model_info(product_id);
+                            s.product_id = product_id;
+                            s.has_anc = info.has_anc;
+                            s.has_adaptive = info.has_adaptive;
+                            s.model = Some(info.name.to_string());
+                        }
+                    }
+                } else {
+                    let info = crate::devices::apple_models::model_info(product_id);
+                    let mut s = AirPodsDeviceState::new(name);
+                    s.product_id = product_id;
+                    s.has_anc = info.has_anc;
+                    s.has_adaptive = info.has_adaptive;
+                    if product_id != 0 {
+                        s.model = Some(info.name.to_string());
+                    }
+                    self.devices.insert(mac.clone(), DeviceState::AirPods(s));
+                    self.device_order.push(mac);
+                }
+            }
+            AppEvent::DeviceDisconnected(mac) => {
+                self.devices.remove(&mac);
+                self.device_order.retain(|m| m != &mac);
+                if self.selected_device_idx >= self.device_order.len() && !self.device_order.is_empty() {
+                    self.selected_device_idx = self.device_order.len() - 1;
+                }
+            }
+            AppEvent::AACPEvent(mac, event) => {
+                self.handle_aacp_event(&mac, *event);
+            }
+            AppEvent::AudioUnavailable => {
+                self.audio_unavailable = true;
+            }
+        }
+    }
+
     /// Drain all pending AppEvents and update state.
     pub fn process_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
-            match event {
-                AppEvent::DeviceConnected { mac, name, product_id } => {
-                    if self.devices.contains_key(&mac) {
-                        if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(&mac) {
-                            s.name = name;
-                            // Fix race: AACP events may arrive before DeviceConnected,
-                            // so update product_id and model info now
-                            if product_id != 0 && s.product_id == 0 {
-                                let info = crate::devices::apple_models::model_info(product_id);
-                                s.product_id = product_id;
-                                s.has_anc = info.has_anc;
-                                s.has_adaptive = info.has_adaptive;
-                                s.model = Some(info.name.to_string());
-                            }
-                        }
-                    } else {
-                        let info = crate::devices::apple_models::model_info(product_id);
-                        let mut s = AirPodsDeviceState::new(name);
-                        s.product_id = product_id;
-                        s.has_anc = info.has_anc;
-                        s.has_adaptive = info.has_adaptive;
-                        if product_id != 0 {
-                            s.model = Some(info.name.to_string());
-                        }
-                        self.devices.insert(mac.clone(), DeviceState::AirPods(s));
-                        self.device_order.push(mac);
-                    }
-                }
-                AppEvent::DeviceDisconnected(mac) => {
-                    self.devices.remove(&mac);
-                    self.device_order.retain(|m| m != &mac);
-                    if self.selected_device_idx >= self.device_order.len() && !self.device_order.is_empty() {
-                        self.selected_device_idx = self.device_order.len() - 1;
-                    }
-                }
-                AppEvent::AACPEvent(mac, event) => {
-                    self.handle_aacp_event(&mac, *event);
-                }
-                AppEvent::AudioUnavailable => {
-                    self.audio_unavailable = true;
-                }
-            }
+            self.handle_event(event);
         }
     }
 
@@ -351,11 +356,13 @@ impl App {
                             }
                         }
                     }
-                    let mut content = String::new();
-                    if let Some((l, _)) = state.battery_left { content.push_str(&format!("LEFT={}\n", l)); }
-                    if let Some((r, _)) = state.battery_right { content.push_str(&format!("RIGHT={}\n", r)); }
-                    if let Some((c, _)) = state.battery_case { content.push_str(&format!("CASE={}\n", c)); }
-                    let _ = std::fs::write(crate::utils::runtime_dir().join("airpods-battery.env"), content);
+                    let bat_left = state.battery_left.map(|(l, _)| l);
+                    let bat_right = state.battery_right.map(|(r, _)| r);
+                    let bat_case = state.battery_case.map(|(c, _)| c);
+                    // Write battery env file in a background thread to avoid blocking the TUI loop
+                    std::thread::spawn(move || {
+                        crate::utils::write_battery_env(bat_left, bat_right, bat_case);
+                    });
                 }
                 AACPEvent::DeviceInfo(info) => {
                     if !info.name.is_empty() {
@@ -465,14 +472,18 @@ impl App {
     }
 
     pub fn send_command(&self, mac: &str, id: ControlCommandIdentifiers, value: Vec<u8>) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send((mac.to_string(), DeviceCommand::ControlCommand(id, value)));
+        if let Some(tx) = &self.command_tx
+            && let Err(e) = tx.send((mac.to_string(), DeviceCommand::ControlCommand(id, value)))
+        {
+            log::warn!("Failed to send control command {:?}: {}", id, e);
         }
     }
 
     pub fn send_rename(&self, mac: &str, name: String) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send((mac.to_string(), DeviceCommand::Rename(name)));
+        if let Some(tx) = &self.command_tx
+            && let Err(e) = tx.send((mac.to_string(), DeviceCommand::Rename(name.clone())))
+        {
+            log::warn!("Failed to send rename '{}': {}", name, e);
         }
     }
 }

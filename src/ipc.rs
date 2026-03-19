@@ -60,7 +60,45 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
             // For control commands / battery, replace previous of same variant per device
             use crate::bluetooth::aacp::AACPEvent as AE;
             match &**aacp_event {
-                AE::BatteryInfo(_) => {
+                AE::BatteryInfo(new_infos) => {
+                    // Preserve last known "good" case battery when the new event
+                    // reports Case as Disconnected (case was closed).  Without this,
+                    // new IPC clients that replay the snapshot would lose the case
+                    // level because handle_aacp_event skips Disconnected case entries.
+                    use crate::bluetooth::aacp::{BatteryComponent, BatteryStatus};
+                    let new_has_case = new_infos.iter().any(|b| {
+                        b.component == BatteryComponent::Case
+                            && b.status != BatteryStatus::Disconnected
+                    });
+                    if !new_has_case {
+                        // Find the previous case battery entry from the old snapshot
+                        let prev_case = snapshot.iter().find_map(|e| {
+                            if let AppEvent::AACPEvent(m, ae) = e
+                                && m == mac
+                                && let AE::BatteryInfo(prev) = &**ae
+                            {
+                                prev.iter().find(|b| {
+                                    b.component == BatteryComponent::Case
+                                        && b.status != BatteryStatus::Disconnected
+                                }).cloned()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(case_info) = prev_case {
+                            // Rebuild the event with the preserved case entry
+                            let mut merged = new_infos.clone();
+                            merged.retain(|b| b.component != BatteryComponent::Case);
+                            merged.push(case_info);
+                            let merged_event = AppEvent::AACPEvent(
+                                mac.clone(),
+                                Box::new(AE::BatteryInfo(merged)),
+                            );
+                            snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::BatteryInfo(_))));
+                            snapshot.push(merged_event);
+                            return;
+                        }
+                    }
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::BatteryInfo(_))));
                 }
                 AE::ControlCommand(cmd) => {
@@ -81,7 +119,9 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                 AE::EqData(_) => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EqData(_))));
                 }
-                _ => {}
+                // Transient events (StemPress, AudioSource, etc.) are not
+                // meaningful to replay — skip storing them in the snapshot.
+                _ => return,
             }
             snapshot.push(event.clone());
         }
