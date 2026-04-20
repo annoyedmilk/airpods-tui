@@ -181,11 +181,13 @@ fn main() -> io::Result<()> {
                         let mut bat_left = None;
                         let mut bat_right = None;
                         let mut bat_case = None;
+                        let mut bat_headphone = None;
                         for b in infos {
                             match b.component {
                                 crate::bluetooth::aacp::BatteryComponent::Left => bat_left = Some(b.level),
                                 crate::bluetooth::aacp::BatteryComponent::Right => bat_right = Some(b.level),
                                 crate::bluetooth::aacp::BatteryComponent::Case if b.status != crate::bluetooth::aacp::BatteryStatus::Disconnected => bat_case = Some(b.level),
+                                crate::bluetooth::aacp::BatteryComponent::Headphone => bat_headphone = Some(b.level),
                                 _ => {}
                             }
                             if b.status == crate::bluetooth::aacp::BatteryStatus::NotCharging {
@@ -201,7 +203,7 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
-                        crate::utils::write_battery_env(bat_left, bat_right, bat_case);
+                        crate::utils::write_battery_env(bat_left, bat_right, bat_case, bat_headphone);
                     }
                 }
             });
@@ -374,7 +376,7 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
         let json = match app.selected_device() {
             Some(DeviceState::AirPods(s)) => {
                 let model_name = s.model.as_deref().unwrap_or(&s.name);
-                let min_bat = [s.battery_left, s.battery_right]
+                let min_bat = [s.battery_left, s.battery_right, s.battery_headphone]
                     .iter()
                     .filter_map(|b| b.as_ref().map(|(l, _)| *l))
                     .min();
@@ -384,6 +386,7 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
                 if let Some((l, _)) = s.battery_left { tooltip_parts.push(format!("L: {}%", l)); }
                 if let Some((r, _)) = s.battery_right { tooltip_parts.push(format!("R: {}%", r)); }
                 if let Some((c, _)) = s.battery_case { tooltip_parts.push(format!("C: {}%", c)); }
+                if let Some((h, _)) = s.battery_headphone { tooltip_parts.push(format!("{}%", h)); }
                 let tooltip = tooltip_parts.join("\\n");
                 format!(
                     r#"{{"text":"{}","tooltip":"{}","class":"connected","percentage":{}}}"#,
