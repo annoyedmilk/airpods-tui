@@ -291,11 +291,10 @@ fn draw_settings_table(
                 }
                 SettingsItem::Slider { label, value, min, max, .. } => {
                     let range = (*max - *min) as usize;
-                    let filled = if range > 0 {
-                        ((*value - *min) as usize * 10 / range).min(10)
-                    } else {
-                        0
-                    };
+                    let filled = ((*value - *min) as usize * 10)
+                        .checked_div(range)
+                        .unwrap_or(0)
+                        .min(10);
                     let bar = format!("{}{}  {:>3}%", "█".repeat(filled), "░".repeat(10 - filled), value);
                     Row::new(vec![
                         Line::from(vec![cursor, Span::styled(*label, label_style)]),

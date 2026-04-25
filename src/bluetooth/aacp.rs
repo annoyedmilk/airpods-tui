@@ -7,7 +7,6 @@ use bluer::{
 };
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::sync::Arc;

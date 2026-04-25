@@ -30,8 +30,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::unbounded_channel;
 
-/// AACP service UUID used by AirPods for battery/settings communication.
-const AIRPODS_AACP_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
+use crate::bluetooth::AIRPODS_AACP_UUID;
 
 #[derive(Parser)]
 #[command(name = "airpods-tui", about = "AirPods TUI controls for Linux")]

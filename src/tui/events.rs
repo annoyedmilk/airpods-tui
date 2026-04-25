@@ -18,24 +18,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         // Tab / Shift+Tab: cycle focused section
-        KeyCode::Tab => {
-            if has_settings(app) {
-                app.focused_section = app.focused_section.next();
-                app.section_row = 0;
-            }
+        KeyCode::Tab if has_settings(app) => {
+            app.focused_section = app.focused_section.next();
+            app.section_row = 0;
         }
-        KeyCode::BackTab => {
-            if has_settings(app) {
-                app.focused_section = app.focused_section.prev();
-                app.section_row = 0;
-            }
+        KeyCode::BackTab if has_settings(app) => {
+            app.focused_section = app.focused_section.prev();
+            app.section_row = 0;
         }
 
         // Up/Down: navigate within current section
-        KeyCode::Up => {
-            if app.section_row > 0 {
-                app.section_row -= 1;
-            }
+        KeyCode::Up if app.section_row > 0 => {
+            app.section_row -= 1;
         }
         KeyCode::Down => {
             let max = section_max_row(app);
@@ -153,10 +147,8 @@ fn handle_rename_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             buf.pop();
         }
-        KeyCode::Char(c) => {
-            if buf.len() < 32 {
-                buf.push(c);
-            }
+        KeyCode::Char(c) if buf.len() < 32 => {
+            buf.push(c);
         }
         _ => {}
     }
