@@ -918,8 +918,12 @@ impl MediaController {
                     debug!("Set user_played_the_media to true as media was playing");
                 }
             }
-        } else if new_all_out {
-            debug!("Condition met: buds removed, pausing media");
+        } else if new_all_out && !old_all_out {
+            // Only on the ear-removal transition. Firing on every event where
+            // both buds are already out (e.g. AirPods echo redundant ear state)
+            // would re-deactivate A2DP repeatedly, forcing wireplumber to
+            // renegotiate the bluez profile and producing audible glitches.
+            debug!("Condition met: ear-out transition, pausing media");
             self.pause().await;
             {
                 let state = self.state.lock().await;
