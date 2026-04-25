@@ -16,7 +16,7 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 - Auto audio rerouting to AirPods on connect
 - Waybar JSON output (`--waybar` / `--waybar-watch`)
 - Background daemon with IPC for seamless reconnection
-- Supports 26 Apple/Beats models with per-model capability detection
+- Supports 28 Apple/Beats models with per-model capability detection
 
 ## Install on Omarchy
 

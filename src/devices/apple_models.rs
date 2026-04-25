@@ -22,8 +22,10 @@ pub fn model_info(product_id: u16) -> AppleModelInfo {
         0x2024 => AppleModelInfo { name: "AirPods Pro (USB-C)",  has_anc: true,  has_adaptive: true,  has_stem_controls: true,  has_conversation_awareness: true  },
         0x200a => AppleModelInfo { name: "AirPods Max",          has_anc: true,  has_adaptive: false,has_stem_controls: false, has_conversation_awareness: false },
         0x201f => AppleModelInfo { name: "AirPods Max (2024)",   has_anc: true,  has_adaptive: false,has_stem_controls: false, has_conversation_awareness: false },
+        0x202d => AppleModelInfo { name: "AirPods Max 2",        has_anc: true,  has_adaptive: true, has_stem_controls: false, has_conversation_awareness: true  },
         0x200b => AppleModelInfo { name: "Powerbeats Pro",       has_anc: false, has_adaptive: false, has_stem_controls: false, has_conversation_awareness: false },
         0x201d => AppleModelInfo { name: "Powerbeats Pro 2",     has_anc: true,  has_adaptive: false, has_stem_controls: false, has_conversation_awareness: false },
+        0x202f => AppleModelInfo { name: "Powerbeats Fit",       has_anc: true,  has_adaptive: false, has_stem_controls: false, has_conversation_awareness: false },
         0x2006 => AppleModelInfo { name: "Beats Solo3",          has_anc: false, has_adaptive: false,has_stem_controls: false, has_conversation_awareness: false },
         0x200c => AppleModelInfo { name: "Beats Solo Pro",       has_anc: true,  has_adaptive: false,has_stem_controls: false, has_conversation_awareness: false },
         0x2009 => AppleModelInfo { name: "Beats Studio3",        has_anc: true,  has_adaptive: false,has_stem_controls: false, has_conversation_awareness: false },
@@ -44,7 +46,7 @@ pub fn model_info(product_id: u16) -> AppleModelInfo {
 
 /// Returns true for models that require the AapInitExt packet to unlock Adaptive ANC.
 pub fn needs_init_ext(product_id: u16) -> bool {
-    matches!(product_id, 0x201b | 0x2014 | 0x2027 | 0x2024)
+    matches!(product_id, 0x201b | 0x2014 | 0x2027 | 0x2024 | 0x202d)
 }
 
 /// Parse a BlueZ Modalias string like "bluetooth:v004cp200edB087"
@@ -98,7 +100,9 @@ mod tests {
         assert!(needs_init_ext(0x201b)); // AirPods 4 ANC
         assert!(needs_init_ext(0x2027)); // AirPods Pro 3
         assert!(needs_init_ext(0x2024)); // AirPods Pro USB-C
+        assert!(needs_init_ext(0x202d)); // AirPods Max 2
         assert!(!needs_init_ext(0x2002)); // AirPods 1st gen
         assert!(!needs_init_ext(0x200a)); // AirPods Max
+        assert!(!needs_init_ext(0x202f)); // Powerbeats Fit
     }
 }
