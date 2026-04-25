@@ -642,14 +642,6 @@ fn spawn_airpods_init(
             managers.insert(addr_str.clone(), DeviceManagers::placeholder());
         }
 
-        if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
-            mac: addr_str.clone(),
-            name,
-            product_id,
-        }) {
-            log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
-        }
-
         match AirPodsDevice::new(addr, ctx.app_tx.clone(), product_id, ctx.config, Some(ctx.reconnect_tx)).await {
             Ok(airpods_device) => {
                 let mut managers = ctx.device_managers.write().await;
@@ -657,10 +649,24 @@ fn spawn_airpods_init(
                     .entry(addr_str.clone())
                     .and_modify(|dm| dm.set_aacp(airpods_device.aacp_manager.clone()))
                     .or_insert_with(|| DeviceManagers::with_aacp(airpods_device.aacp_manager));
+                drop(managers);
+                // Notify the TUI only once AACP is alive. The handle_aacp_event
+                // path auto-creates a placeholder device entry if any AACP event
+                // arrived during init, so this ordering is safe.
+                if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
+                    mac: addr_str.clone(),
+                    name,
+                    product_id,
+                }) {
+                    log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
+                }
             }
             Err(e) => {
                 log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
                 ctx.device_managers.write().await.remove(&addr_str);
+                // No DeviceConnected was sent; nothing to roll back. If an AACP
+                // event auto-created a placeholder, sweep it now.
+                let _ = ctx.app_tx.send(AppEvent::DeviceDisconnected(addr_str.clone()));
             }
         }
     });

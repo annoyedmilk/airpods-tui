@@ -27,6 +27,17 @@ impl AirPodsDevice {
         let mut aacp_manager = AACPManager::new();
         aacp_manager.connect(mac_address).await;
 
+        // connect() logs but doesn't return an error. If the L2CAP socket
+        // didn't come up, sender stays None and every later send_*  call would
+        // log "Cannot send packet, sender is not available." Bail here instead
+        // so the caller can decide whether to retry.
+        if aacp_manager.state.lock().await.sender.is_none() {
+            return Err(bluer::Error {
+                kind: bluer::ErrorKind::ConnectionAttemptFailed,
+                message: format!("L2CAP connect to {} did not establish", mac_address),
+            });
+        }
+
         // ── Set up event channel and ALL subscriptions BEFORE sending any packets ──
         // Otherwise the AirPods respond to handshake/notifications before we're listening,
         // and battery info, device info, and control command states are silently dropped.
