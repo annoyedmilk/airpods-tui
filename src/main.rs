@@ -153,7 +153,7 @@ fn main() -> io::Result<()> {
 
     if args.daemon {
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async move {
+        let exit_code = rt.block_on(async move {
             let snapshot: ipc::StateSnapshot =
                 Arc::new(RwLock::new(Vec::new()));
             let ipc_server = Arc::new(ipc::IpcServer::new(snapshot.clone(), cmd_tx));
@@ -218,24 +218,34 @@ fn main() -> io::Result<()> {
             let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("failed to register SIGTERM handler");
 
-            tokio::select! {
+            let exit_code: i32 = tokio::select! {
                 result = bluetooth_main(app_tx_bt, dm_clone, cmd_rx, bt_config) => {
-                    if let Err(e) = result {
-                        log::error!("Bluetooth error: {}", e);
+                    match result {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            log::error!("Bluetooth error: {}", e);
+                            1
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     log::info!("Received SIGINT, shutting down...");
+                    0
                 }
                 _ = sigterm.recv() => {
                     log::info!("Received SIGTERM, shutting down...");
+                    0
                 }
-            }
+            };
 
             ipc_handle.abort();
             let _ = std::fs::remove_file(ipc::socket_path());
             log::info!("Daemon shutdown complete");
+            exit_code
         });
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
         return Ok(());
     }
 
