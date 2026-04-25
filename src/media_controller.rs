@@ -688,6 +688,10 @@ struct MediaControllerState {
     current_audio_source: Option<AudioSource>,
     /// Set when Linux had active audio and another device took it; cleared on reclaim.
     should_reclaim_on_none: bool,
+    /// Monotonic counter incremented on every AUDIO_SOURCE event. A pending
+    /// reclaim task captures the value at scheduling time and bails if it has
+    /// changed when the settle window expires (i.e. a fresher event arrived).
+    reclaim_generation: u64,
     config: Config,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
     session_conn: Option<zbus::Connection>,
@@ -716,6 +720,7 @@ impl MediaControllerState {
             playback_listener_running: false,
             current_audio_source: None,
             should_reclaim_on_none: false,
+            reclaim_generation: 0,
             config,
             audio_tx,
             session_conn: None,
@@ -813,6 +818,23 @@ impl MediaController {
 
                 if !ear_ok {
                     info!("Media playback started but buds not in ear, skipping takeover");
+                    continue;
+                }
+
+                // Skip the claim when AirPods already credit Linux as the audio
+                // source. Avoids a redundant OwnsConnection=01 echo cycle.
+                let already_owned = {
+                    let state = self.state.lock().await;
+                    let local_mac = state.local_mac.to_uppercase();
+                    state
+                        .current_audio_source
+                        .as_ref()
+                        .is_some_and(|s| s.mac.to_uppercase() == local_mac)
+                };
+                if already_owned {
+                    debug!("Playback started but Linux already owns audio per AirPods, no claim needed");
+                    let mut state = self.state.lock().await;
+                    state.should_reclaim_on_none = false;
                     continue;
                 }
 
@@ -1182,17 +1204,25 @@ impl MediaController {
     ///
     /// Three cases:
     /// 1. Another device claimed audio while Linux was playing → pause and arm reclaim flag.
-    /// 2. The remote device released audio (`None`) and we had armed the flag → send
-    ///    `OwnsConnection` claim and resume local playback.
-    /// 3. Anything else (e.g. Linux's own MAC, or we weren't playing) → just update state.
+    /// 2. We had armed the flag and now see `type=None` → schedule a delayed
+    ///    reclaim. The AirPods routinely emit a transient `None` packet during
+    ///    handoff that is followed within ~1s by a fresh `iphone/Media`, so we
+    ///    settle for `RECLAIM_SETTLE_MS` and let any new AUDIO_SOURCE event
+    ///    cancel the pending reclaim via the generation counter.
+    /// 3. Anything else → just update state.
     pub async fn handle_audio_source_change(
         &self,
         source: AudioSource,
         aacp_manager: &AACPManager,
     ) {
+        // Settle window for a `None` packet before reclaiming. Long enough to
+        // absorb the AirPods' transient blip during handoff (observed up to
+        // ~1s), short enough that legitimate "peer paused" reclaims feel snappy.
+        const RECLAIM_SETTLE_MS: u64 = 1500;
+
         enum Action {
             Pause,
-            Reclaim,
+            ScheduleReclaim,
             Nothing,
         }
 
@@ -1211,38 +1241,44 @@ impl MediaController {
             }
         };
 
-        let action = {
+        let (action, my_gen) = {
             let mut state = self.state.lock().await;
+            // Bump generation on every event. Any in-flight reclaim task
+            // captured an older value and will bail when it sees the mismatch.
+            state.reclaim_generation = state.reclaim_generation.wrapping_add(1);
+            let my_gen = state.reclaim_generation;
+
             let local_mac = state.local_mac.to_uppercase();
             let source_mac = source.mac.to_uppercase();
             let source_is_other = source_mac != local_mac;
             let source_is_none = source.r#type == AudioSourceType::None;
 
-            // "Linux was the prior owner" — authoritative per the last AUDIO_SOURCE,
-            // captured before we overwrite current_audio_source below.
-            let we_previously_owned = state
-                .current_audio_source
-                .as_ref()
-                .map(|s| {
-                    s.mac.to_uppercase() == local_mac && s.r#type != AudioSourceType::None
-                })
-                .unwrap_or(false);
+            // Keep current_audio_source as the *last non-None* source. None
+                        // packets do not clear it. This matches xatuke/handoff and keeps
+            // peer-vs-local ownership reliable across the AirPods' transient
+            // None blips during handoff.
+            if !source_is_none {
+                state.current_audio_source = Some(source.clone());
+            }
 
-            if source_is_other && !source_is_none {
-                let had_audio = state.is_playing || pa_active || we_previously_owned;
-                state.current_audio_source = Some(source);
+            let act = if source_is_other && !source_is_none {
+                // Arm reclaim only when Linux is *currently* producing audio.
+                let had_audio = state.is_playing || pa_active;
                 if had_audio {
                     state.should_reclaim_on_none = true;
                 }
                 Action::Pause
             } else if source_is_none && state.should_reclaim_on_none {
-                state.current_audio_source = None;
-                state.should_reclaim_on_none = false;
-                Action::Reclaim
+                // Leave should_reclaim_on_none set; the reclaim task clears it
+                // on success. If a fresh non-None AUDIO_SOURCE arrives within
+                // the settle window the generation check cancels the task and
+                // the flag remains armed for the next None.
+                Action::ScheduleReclaim
             } else {
-                state.current_audio_source = if source_is_none { None } else { Some(source) };
                 Action::Nothing
-            }
+            };
+
+            (act, my_gen)
         }; // ← state lock released before any await
 
         match action {
@@ -1252,19 +1288,48 @@ impl MediaController {
                 // in paused_by_app_services and self.resume() can restore them later.
                 self.pause().await;
             }
-            Action::Reclaim => {
-                info!("Peer device released audio, reclaiming ownership");
-                if let Err(e) = aacp_manager
-                    .send_control_command(
-                        crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
-                        &[0x01],
-                    )
-                    .await
-                {
-                    error!("Failed to send OwnsConnection claim: {}", e);
-                }
-                self.force_audio_stream_restart().await;
-                self.resume().await;
+            Action::ScheduleReclaim => {
+                info!(
+                    "Peer source went None, scheduling reclaim in {}ms (gen {})",
+                    RECLAIM_SETTLE_MS, my_gen
+                );
+                let mc = self.clone();
+                let aacp = aacp_manager.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(RECLAIM_SETTLE_MS)).await;
+                    let mut state = mc.state.lock().await;
+                    if state.reclaim_generation != my_gen {
+                        debug!(
+                            "Reclaim cancelled: gen {} superseded by {}",
+                            my_gen, state.reclaim_generation
+                        );
+                        return;
+                    }
+                    if !state.should_reclaim_on_none {
+                        debug!("Reclaim aborted: flag cleared by another path");
+                        return;
+                    }
+                    state.should_reclaim_on_none = false;
+                    drop(state);
+
+                    info!("Settle window expired, reclaiming ownership");
+                    if let Err(e) = aacp
+                        .send_control_command(
+                            crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
+                            &[0x01],
+                        )
+                        .await
+                    {
+                        error!("Failed to send OwnsConnection claim: {}", e);
+                    }
+                    // Suspend/resume the bluez sink to force a fresh AVDTP_START
+                    // handshake. We deliberately do NOT Play the previously
+                    // paused MPRIS players: doing so feeds the listener loop a
+                    // Playing transition that re-fires OwnsConnection=01 and
+                    // cascades against the peer device. The user can press play
+                    // themselves; ownership has already transferred.
+                    mc.force_audio_stream_restart().await;
+                });
             }
             Action::Nothing => {}
         }
