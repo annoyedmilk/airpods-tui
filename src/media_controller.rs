@@ -79,6 +79,15 @@ enum AudioCommand {
         sink_name: String,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    SuspendSinkByName {
+        sink_name: String,
+        suspend: bool,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    HasActiveSinkInput {
+        sink_name: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// Spawn a single background thread that owns the PulseAudio Mainloop + Context.
@@ -184,6 +193,19 @@ fn spawn_audio_thread(
                 }
                 AudioCommand::MoveAllSinkInputs { sink_name, reply } => {
                     let result = pa_move_all_sink_inputs(&mut mainloop, &mut context, &sink_name);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::SuspendSinkByName {
+                    sink_name,
+                    suspend,
+                    reply,
+                } => {
+                    let result =
+                        pa_suspend_sink_by_name(&mut mainloop, &mut context, &sink_name, suspend);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::HasActiveSinkInput { sink_name, reply } => {
+                    let result = pa_has_active_sink_input(&mut mainloop, &context, &sink_name);
                     let _ = reply.send(result);
                 }
             }
@@ -296,6 +318,66 @@ fn pa_move_all_sink_inputs(mainloop: &mut Mainloop, context: &mut Context, sink_
         }
     }
     true
+}
+
+fn pa_suspend_sink_by_name(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    sink_name: &str,
+    suspend: bool,
+) -> bool {
+    let success = Rc::new(RefCell::new(false));
+    let op = context.introspect().suspend_sink_by_name(
+        sink_name,
+        suspend,
+        Some(Box::new({
+            let success = success.clone();
+            move |result: bool| {
+                *success.borrow_mut() = result;
+            }
+        })),
+    );
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    *success.borrow()
+}
+
+fn pa_has_active_sink_input(mainloop: &mut Mainloop, context: &Context, sink_name: &str) -> bool {
+    let introspector = context.introspect();
+
+    let target_index = Rc::new(RefCell::new(None::<u32>));
+    let op = introspector.get_sink_info_by_name(sink_name, {
+        let target_index = target_index.clone();
+        move |result: ListResult<&SinkInfo>| {
+            if let ListResult::Item(item) = result {
+                *target_index.borrow_mut() = Some(item.index);
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    let Some(idx) = *target_index.borrow() else {
+        return false;
+    };
+
+    let active = Rc::new(RefCell::new(false));
+    let op = introspector.get_sink_input_info_list({
+        let active = active.clone();
+        move |result: ListResult<&SinkInputInfo>| {
+            if let ListResult::Item(item) = result
+                && item.sink == idx
+                && !item.corked
+            {
+                *active.borrow_mut() = true;
+            }
+        }
+    });
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    *active.borrow()
 }
 
 fn pa_get_sink_volume(mainloop: &mut Mainloop, context: &Context, sink_name: &str) -> Option<u32> {
@@ -553,6 +635,32 @@ async fn audio_cmd_move_all_sink_inputs(
 ) -> bool {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(AudioCommand::MoveAllSinkInputs {
+        sink_name: sink_name.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_suspend_sink(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+    suspend: bool,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::SuspendSinkByName {
+        sink_name: sink_name.to_string(),
+        suspend,
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_has_active_sink_input(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::HasActiveSinkInput {
         sink_name: sink_name.to_string(),
         reply: reply_tx,
     });
@@ -1078,12 +1186,26 @@ impl MediaController {
         source: AudioSource,
         aacp_manager: &AACPManager,
     ) {
-        // Snapshot + mutate state under a single lock, then release before doing any I/O.
         enum Action {
             Pause,
             Reclaim,
             Nothing,
         }
+
+        // Probe PulseAudio for any non-corked sink input on the bluez sink before
+        // touching state. This catches Discord/games/browser audio that doesn't
+        // expose MPRIS, so the reclaim flag arms even when `is_playing` is false.
+        let pa_active = {
+            let (mac, audio_tx) = {
+                let state = self.state.lock().await;
+                (state.connected_device_mac.clone(), state.audio_tx.clone())
+            };
+            if let Some(sink_name) = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await {
+                audio_cmd_has_active_sink_input(&audio_tx, &sink_name).await
+            } else {
+                false
+            }
+        };
 
         let action = {
             let mut state = self.state.lock().await;
@@ -1092,16 +1214,24 @@ impl MediaController {
             let source_is_other = source_mac != local_mac;
             let source_is_none = source.r#type == AudioSourceType::None;
 
+            // "Linux was the prior owner" — authoritative per the last AUDIO_SOURCE,
+            // captured before we overwrite current_audio_source below.
+            let we_previously_owned = state
+                .current_audio_source
+                .as_ref()
+                .map(|s| {
+                    s.mac.to_uppercase() == local_mac && s.r#type != AudioSourceType::None
+                })
+                .unwrap_or(false);
+
             if source_is_other && !source_is_none {
-                // A peer device has claimed the audio stream.
-                let had_audio = state.is_playing;
+                let had_audio = state.is_playing || pa_active || we_previously_owned;
                 state.current_audio_source = Some(source);
                 if had_audio {
                     state.should_reclaim_on_none = true;
                 }
                 Action::Pause
             } else if source_is_none && state.should_reclaim_on_none {
-                // Peer released audio and we want it back.
                 state.current_audio_source = None;
                 state.should_reclaim_on_none = false;
                 Action::Reclaim
@@ -1129,9 +1259,42 @@ impl MediaController {
                 {
                     error!("Failed to send OwnsConnection claim: {}", e);
                 }
+                self.force_audio_stream_restart().await;
                 self.resume().await;
             }
             Action::Nothing => {}
+        }
+    }
+
+    /// Force AirPods to issue a fresh AVDTP_START handshake by suspending and
+    /// resuming the bluez sink. After a peer-device steal the sink is left in
+    /// A2DP-suspended state — `set_card_profile` is a no-op since the profile
+    /// is unchanged, so the audio stream never restarts. Falls back to profile
+    /// activation if the suspend path fails.
+    async fn force_audio_stream_restart(&self) {
+        let (mac, audio_tx) = {
+            let state = self.state.lock().await;
+            (state.connected_device_mac.clone(), state.audio_tx.clone())
+        };
+
+        let Some(sink_name) = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await else {
+            warn!("No sink for {}, falling back to profile activation", mac);
+            self.activate_a2dp_profile().await;
+            return;
+        };
+
+        info!("Forcing AVDTP_START via sink suspend/resume on {}", sink_name);
+        if !audio_cmd_suspend_sink(&audio_tx, &sink_name, true).await {
+            warn!("PulseAudio suspend failed, falling back to profile cycle");
+            self.activate_a2dp_profile().await;
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        if !audio_cmd_suspend_sink(&audio_tx, &sink_name, false).await {
+            warn!("PulseAudio resume failed, falling back to profile cycle");
+            self.activate_a2dp_profile().await;
         }
     }
 

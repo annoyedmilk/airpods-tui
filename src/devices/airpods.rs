@@ -154,16 +154,19 @@ impl AirPodsDevice {
             .await;
         drop(mc_listener);
 
-        // OwnsConnection handler
+        // OwnsConnection handler. Pauses MPRIS but leaves the bluez profile in
+        // A2DP. Switching the card profile to "off" here forced wireplumber to
+        // renegotiate when audio came back, producing an audible quality drop.
+        // The AUDIO_SOURCE handler already pauses on peer-takes-audio without
+        // touching the profile, so this stays consistent with that path.
         let mc_clone_owns = media_controller.clone();
         tokio::spawn(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
-                    info!("Lost ownership, pausing media and disconnecting audio");
+                    info!("Lost ownership, pausing local media");
                     let controller = mc_clone_owns.lock().await;
                     controller.pause_all_media().await;
-                    controller.deactivate_a2dp_profile().await;
                 }
             }
         });
