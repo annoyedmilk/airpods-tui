@@ -2,21 +2,27 @@ use crate::bluetooth::aacp::AACPManager;
 use std::sync::Arc;
 
 pub struct DeviceManagers {
-    aacp: Arc<AACPManager>,
+    aacp: Option<Arc<AACPManager>>,
 }
 
 impl DeviceManagers {
+    /// Reserve a HashMap slot before async init starts so concurrent
+    /// connection events can detect the in-progress claim.
+    pub fn placeholder() -> Self {
+        Self { aacp: None }
+    }
+
     pub fn with_aacp(aacp: AACPManager) -> Self {
         Self {
-            aacp: Arc::new(aacp),
+            aacp: Some(Arc::new(aacp)),
         }
     }
 
     pub fn set_aacp(&mut self, manager: AACPManager) {
-        self.aacp = Arc::new(manager);
+        self.aacp = Some(Arc::new(manager));
     }
 
-    pub fn get_aacp(&self) -> Arc<AACPManager> {
+    pub fn get_aacp(&self) -> Option<Arc<AACPManager>> {
         self.aacp.clone()
     }
 }

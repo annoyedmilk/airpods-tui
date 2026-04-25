@@ -466,10 +466,6 @@ impl AACPManager {
         self.send_packet(&packet).await
     }
 
-    pub async fn is_connected(&self) -> bool {
-        self.state.lock().await.sender.is_some()
-    }
-
     pub async fn set_event_channel(&self, tx: mpsc::UnboundedSender<AACPEvent>) {
         let mut state = self.state.lock().await;
         state.event_tx = Some(tx);

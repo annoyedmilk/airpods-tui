@@ -628,16 +628,20 @@ fn spawn_airpods_init(
     let addr_str = addr.to_string();
 
     tokio::spawn(async move {
-        // Dedup: if another init already established a live connection, skip
+        // Atomically claim the slot under a single write lock. If an entry
+        // already exists (either fully ready or another init in progress),
+        // bail before the long async init can race with us. The reconnect
+        // handler removes stale entries before re-spawning, so a leftover
+        // placeholder cannot strand future inits.
         {
-            let managers = ctx.device_managers.read().await;
-            if let Some(dm) = managers.get(&addr_str)
-                && dm.get_aacp().is_connected().await
-            {
-                info!("Skipping init for {} — AACP already connected", addr_str);
+            let mut managers = ctx.device_managers.write().await;
+            if managers.contains_key(&addr_str) {
+                info!("Skipping init for {} — already connected or initializing", addr_str);
                 return;
             }
+            managers.insert(addr_str.clone(), DeviceManagers::placeholder());
         }
+
         if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
             mac: addr_str.clone(),
             name,
@@ -645,17 +649,18 @@ fn spawn_airpods_init(
         }) {
             log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
         }
+
         match AirPodsDevice::new(addr, ctx.app_tx.clone(), product_id, ctx.config, Some(ctx.reconnect_tx)).await {
             Ok(airpods_device) => {
                 let mut managers = ctx.device_managers.write().await;
-                let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
                 managers
                     .entry(addr_str.clone())
-                    .or_insert(dev_managers)
-                    .set_aacp(airpods_device.aacp_manager);
+                    .and_modify(|dm| dm.set_aacp(airpods_device.aacp_manager.clone()))
+                    .or_insert_with(|| DeviceManagers::with_aacp(airpods_device.aacp_manager));
             }
             Err(e) => {
                 log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
+                ctx.device_managers.write().await.remove(&addr_str);
             }
         }
     });
@@ -689,8 +694,9 @@ async fn bluetooth_main(
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
             let managers = dm_cmd.read().await;
-            if let Some(dm) = managers.get(&mac) {
-                let aacp = dm.get_aacp();
+            if let Some(dm) = managers.get(&mac)
+                && let Some(aacp) = dm.get_aacp()
+            {
                 match cmd {
                     tui::app::DeviceCommand::ControlCommand(id, value) => {
                         if let Err(e) = aacp.send_control_command(id, &value).await {
