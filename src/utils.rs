@@ -14,11 +14,17 @@ pub fn runtime_dir() -> PathBuf {
 
 /// Write battery levels to `airpods-battery.env` in the runtime directory
 /// for external consumers (waybar, scripts).
-pub fn write_battery_env(left: Option<u8>, right: Option<u8>, case: Option<u8>) {
+pub fn write_battery_env(
+    left: Option<u8>,
+    right: Option<u8>,
+    case: Option<u8>,
+    headphone: Option<u8>,
+) {
     let mut content = String::new();
     if let Some(l) = left { content.push_str(&format!("LEFT={}\n", l)); }
     if let Some(r) = right { content.push_str(&format!("RIGHT={}\n", r)); }
     if let Some(c) = case { content.push_str(&format!("CASE={}\n", c)); }
+    if let Some(h) = headphone { content.push_str(&format!("HEADPHONE={}\n", h)); }
     if let Err(e) = std::fs::write(runtime_dir().join("airpods-battery.env"), content) {
         log::warn!("Failed to write airpods-battery.env: {}", e);
     }

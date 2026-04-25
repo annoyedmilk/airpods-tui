@@ -359,9 +359,10 @@ impl App {
                     let bat_left = state.battery_left.map(|(l, _)| l);
                     let bat_right = state.battery_right.map(|(r, _)| r);
                     let bat_case = state.battery_case.map(|(c, _)| c);
+                    let bat_headphone = state.battery_headphone.map(|(h, _)| h);
                     // Write battery env file in a background thread to avoid blocking the TUI loop
                     std::thread::spawn(move || {
-                        crate::utils::write_battery_env(bat_left, bat_right, bat_case);
+                        crate::utils::write_battery_env(bat_left, bat_right, bat_case, bat_headphone);
                     });
                 }
                 AACPEvent::DeviceInfo(info) => {
