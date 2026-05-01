@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
-pub fn socket_path() -> PathBuf {
-    crate::utils::runtime_dir().join("airpods-tui.sock")
+pub fn socket_path() -> std::io::Result<PathBuf> {
+    Ok(crate::utils::runtime_dir()?.join("airpods-tui.sock"))
 }
 
 async fn write_msg(stream: &mut (impl AsyncWriteExt + Unpin), data: &[u8]) -> std::io::Result<()> {
@@ -77,10 +77,12 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                                 && m == mac
                                 && let AE::BatteryInfo(prev) = &**ae
                             {
-                                prev.iter().find(|b| {
-                                    b.component == BatteryComponent::Case
-                                        && b.status != BatteryStatus::Disconnected
-                                }).cloned()
+                                prev.iter()
+                                    .find(|b| {
+                                        b.component == BatteryComponent::Case
+                                            && b.status != BatteryStatus::Disconnected
+                                    })
+                                    .cloned()
                             } else {
                                 None
                             }
@@ -90,10 +92,8 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                             let mut merged = new_infos.clone();
                             merged.retain(|b| b.component != BatteryComponent::Case);
                             merged.push(case_info);
-                            let merged_event = AppEvent::AACPEvent(
-                                mac.clone(),
-                                Box::new(AE::BatteryInfo(merged)),
-                            );
+                            let merged_event =
+                                AppEvent::AACPEvent(mac.clone(), Box::new(AE::BatteryInfo(merged)));
                             snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::BatteryInfo(_))));
                             snapshot.push(merged_event);
                             return;
@@ -126,7 +126,10 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
             snapshot.push(event.clone());
         }
         AppEvent::AudioUnavailable => {
-            if !snapshot.iter().any(|e| matches!(e, AppEvent::AudioUnavailable)) {
+            if !snapshot
+                .iter()
+                .any(|e| matches!(e, AppEvent::AudioUnavailable))
+            {
                 snapshot.push(event.clone());
             }
         }
@@ -159,7 +162,7 @@ impl IpcServer {
 
     /// Run the IPC server, accepting connections on the Unix socket.
     pub async fn run(&self) -> std::io::Result<()> {
-        let path = socket_path();
+        let path = socket_path()?;
         // Remove stale socket — ignore NotFound, log other errors
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -227,7 +230,8 @@ impl IpcServer {
                         match event_rx.recv().await {
                             Ok(event) => {
                                 if let Ok(json) = serde_json::to_vec(&event)
-                                    && write_tx_clone.send(json).is_err() {
+                                    && write_tx_clone.send(json).is_err()
+                                {
                                     break;
                                 }
                             }
@@ -242,8 +246,12 @@ impl IpcServer {
                 // Read commands from client
                 while let Ok(data) = read_msg(&mut reader).await {
                     match serde_json::from_slice::<(String, DeviceCommand)>(&data) {
-                        Ok(cmd) => { let _ = cmd_tx.send(cmd); }
-                        Err(e) => { error!("Invalid IPC command: {}", e); }
+                        Ok(cmd) => {
+                            let _ = cmd_tx.send(cmd);
+                        }
+                        Err(e) => {
+                            error!("Invalid IPC command: {}", e);
+                        }
                     }
                 }
 
@@ -261,7 +269,7 @@ pub async fn ipc_connect() -> std::io::Result<(
     mpsc::UnboundedSender<(String, DeviceCommand)>,
     mpsc::UnboundedReceiver<AppEvent>,
 )> {
-    let path = socket_path();
+    let path = socket_path()?;
     let stream = UnixStream::connect(&path).await?;
     info!("Connected to IPC daemon at {}", path.display());
 
@@ -298,7 +306,8 @@ pub async fn ipc_connect() -> std::io::Result<(
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             if let Ok(json) = serde_json::to_vec(&cmd)
-                && write_msg(&mut writer, &json).await.is_err() {
+                && write_msg(&mut writer, &json).await.is_err()
+            {
                 break;
             }
         }
@@ -310,12 +319,40 @@ pub async fn ipc_connect() -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bluetooth::aacp::{
+        AACPEvent as AE, AudioSource, AudioSourceType, BatteryComponent, BatteryInfo,
+        BatteryStatus, ConnectedDevice, ControlCommandIdentifiers, ControlCommandStatus,
+        EarDetectionStatus, StemPressBudType, StemPressType,
+    };
+
+    const MAC_A: &str = "AA:BB:CC:DD:EE:FF";
+    const MAC_B: &str = "11:22:33:44:55:66";
+
+    fn battery_event(mac: &str, infos: Vec<BatteryInfo>) -> AppEvent {
+        AppEvent::AACPEvent(mac.into(), Box::new(AE::BatteryInfo(infos)))
+    }
+
+    fn control_event(mac: &str, id: ControlCommandIdentifiers, value: Vec<u8>) -> AppEvent {
+        AppEvent::AACPEvent(
+            mac.into(),
+            Box::new(AE::ControlCommand(ControlCommandStatus {
+                identifier: id,
+                value,
+            })),
+        )
+    }
+
+    fn count_aacp(snap: &[AppEvent], mac: &str) -> usize {
+        snap.iter()
+            .filter(|e| matches!(e, AppEvent::AACPEvent(m, _) if m == mac))
+            .count()
+    }
 
     #[test]
     fn snapshot_replaces_device_on_reconnect() {
         let mut snap = Vec::new();
         let e1 = AppEvent::DeviceConnected {
-            mac: "AA:BB:CC:DD:EE:FF".into(),
+            mac: MAC_A.into(),
             name: "Test".into(),
             product_id: 0x2014,
         };
@@ -323,12 +360,16 @@ mod tests {
         assert_eq!(snap.len(), 1);
 
         let e2 = AppEvent::DeviceConnected {
-            mac: "AA:BB:CC:DD:EE:FF".into(),
+            mac: MAC_A.into(),
             name: "Test Renamed".into(),
             product_id: 0x2014,
         };
         update_snapshot(&mut snap, &e2);
-        assert_eq!(snap.len(), 1); // replaced, not duplicated
+        assert_eq!(snap.len(), 1);
+        match &snap[0] {
+            AppEvent::DeviceConnected { name, .. } => assert_eq!(name, "Test Renamed"),
+            _ => panic!("expected DeviceConnected"),
+        }
     }
 
     #[test]
@@ -337,16 +378,324 @@ mod tests {
         update_snapshot(
             &mut snap,
             &AppEvent::DeviceConnected {
-                mac: "AA:BB:CC:DD:EE:FF".into(),
+                mac: MAC_A.into(),
                 name: "T".into(),
                 product_id: 0,
             },
         );
         assert_eq!(snap.len(), 1);
+        update_snapshot(&mut snap, &AppEvent::DeviceDisconnected(MAC_A.into()));
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn snapshot_disconnect_drops_only_target_device() {
+        let mut snap = Vec::new();
         update_snapshot(
             &mut snap,
-            &AppEvent::DeviceDisconnected("AA:BB:CC:DD:EE:FF".into()),
+            &AppEvent::DeviceConnected {
+                mac: MAC_A.into(),
+                name: "A".into(),
+                product_id: 0,
+            },
         );
-        assert!(snap.is_empty());
+        update_snapshot(
+            &mut snap,
+            &AppEvent::DeviceConnected {
+                mac: MAC_B.into(),
+                name: "B".into(),
+                product_id: 0,
+            },
+        );
+        update_snapshot(&mut snap, &battery_event(MAC_B, vec![]));
+        update_snapshot(&mut snap, &AppEvent::DeviceDisconnected(MAC_A.into()));
+        // B's DeviceConnected + BatteryInfo survive
+        assert_eq!(snap.len(), 2);
+        assert!(matches!(&snap[0], AppEvent::DeviceConnected { mac, .. } if mac == MAC_B));
+    }
+
+    #[test]
+    fn snapshot_battery_replaces_previous_battery() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![BatteryInfo {
+                    component: BatteryComponent::Left,
+                    level: 50,
+                    status: BatteryStatus::NotCharging,
+                }],
+            ),
+        );
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![BatteryInfo {
+                    component: BatteryComponent::Left,
+                    level: 60,
+                    status: BatteryStatus::NotCharging,
+                }],
+            ),
+        );
+        assert_eq!(count_aacp(&snap, MAC_A), 1);
+        match &snap[0] {
+            AppEvent::AACPEvent(_, ae) => match &**ae {
+                AE::BatteryInfo(b) => assert_eq!(b[0].level, 60),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_case_when_new_event_has_disconnected_case() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![
+                    BatteryInfo {
+                        component: BatteryComponent::Left,
+                        level: 80,
+                        status: BatteryStatus::NotCharging,
+                    },
+                    BatteryInfo {
+                        component: BatteryComponent::Case,
+                        level: 40,
+                        status: BatteryStatus::NotCharging,
+                    },
+                ],
+            ),
+        );
+        // case lid closed → reports Disconnected; should preserve previous case level
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![
+                    BatteryInfo {
+                        component: BatteryComponent::Left,
+                        level: 81,
+                        status: BatteryStatus::NotCharging,
+                    },
+                    BatteryInfo {
+                        component: BatteryComponent::Case,
+                        level: 0,
+                        status: BatteryStatus::Disconnected,
+                    },
+                ],
+            ),
+        );
+        let merged = match &snap[0] {
+            AppEvent::AACPEvent(_, ae) => match &**ae {
+                AE::BatteryInfo(b) => b.clone(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        let case = merged
+            .iter()
+            .find(|b| b.component == BatteryComponent::Case)
+            .expect("case retained");
+        assert_eq!(case.level, 40);
+        assert_eq!(case.status, BatteryStatus::NotCharging);
+    }
+
+    #[test]
+    fn snapshot_case_passthrough_when_present() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![BatteryInfo {
+                    component: BatteryComponent::Case,
+                    level: 30,
+                    status: BatteryStatus::NotCharging,
+                }],
+            ),
+        );
+        update_snapshot(
+            &mut snap,
+            &battery_event(
+                MAC_A,
+                vec![BatteryInfo {
+                    component: BatteryComponent::Case,
+                    level: 90,
+                    status: BatteryStatus::Charging,
+                }],
+            ),
+        );
+        match &snap[0] {
+            AppEvent::AACPEvent(_, ae) => match &**ae {
+                AE::BatteryInfo(b) => {
+                    let case = b
+                        .iter()
+                        .find(|x| x.component == BatteryComponent::Case)
+                        .unwrap();
+                    assert_eq!(case.level, 90);
+                    assert_eq!(case.status, BatteryStatus::Charging);
+                }
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn snapshot_control_command_replaces_per_identifier() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_A, ControlCommandIdentifiers::ListeningMode, vec![0x02]),
+        );
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_A, ControlCommandIdentifiers::ListeningMode, vec![0x03]),
+        );
+        // different identifier should accumulate
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_A, ControlCommandIdentifiers::OneBudAncMode, vec![0x01]),
+        );
+        assert_eq!(count_aacp(&snap, MAC_A), 2);
+        let listening = snap.iter().find_map(|e| match e {
+            AppEvent::AACPEvent(_, ae) => match &**ae {
+                AE::ControlCommand(c)
+                    if c.identifier == ControlCommandIdentifiers::ListeningMode =>
+                {
+                    Some(c.value.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(listening, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn snapshot_keeps_devices_independent() {
+        let mut snap = Vec::new();
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_A, ControlCommandIdentifiers::ListeningMode, vec![0x02]),
+        );
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_B, ControlCommandIdentifiers::ListeningMode, vec![0x03]),
+        );
+        // Replacing A's listening mode must not touch B's
+        update_snapshot(
+            &mut snap,
+            &control_event(MAC_A, ControlCommandIdentifiers::ListeningMode, vec![0x04]),
+        );
+        assert_eq!(count_aacp(&snap, MAC_A), 1);
+        assert_eq!(count_aacp(&snap, MAC_B), 1);
+    }
+
+    #[test]
+    fn snapshot_skips_transient_events() {
+        let mut snap = Vec::new();
+        // StemPress, AudioSource, ConversationalAwareness, OwnershipToFalse, ConnectionLost
+        // are transient and should not appear in the replay snapshot.
+        let stem = AppEvent::AACPEvent(
+            MAC_A.into(),
+            Box::new(AE::StemPress(
+                StemPressType::Single,
+                Some(StemPressBudType::Left),
+            )),
+        );
+        let audio = AppEvent::AACPEvent(
+            MAC_A.into(),
+            Box::new(AE::AudioSource(AudioSource {
+                mac: MAC_A.into(),
+                r#type: AudioSourceType::Media,
+            })),
+        );
+        let ca = AppEvent::AACPEvent(MAC_A.into(), Box::new(AE::ConversationalAwareness(1)));
+        let lost = AppEvent::AACPEvent(MAC_A.into(), Box::new(AE::ConnectionLost));
+
+        for e in [&stem, &audio, &ca, &lost] {
+            update_snapshot(&mut snap, e);
+        }
+        assert!(
+            snap.is_empty(),
+            "transient events leaked into snapshot: {:?}",
+            snap
+        );
+    }
+
+    #[test]
+    fn snapshot_replaces_ear_detection_per_device() {
+        let mut snap = Vec::new();
+        let mk = |l: EarDetectionStatus, r: EarDetectionStatus| {
+            AppEvent::AACPEvent(
+                MAC_A.into(),
+                Box::new(AE::EarDetection {
+                    old_left: None,
+                    old_right: None,
+                    new_left: Some(l),
+                    new_right: Some(r),
+                }),
+            )
+        };
+        update_snapshot(
+            &mut snap,
+            &mk(EarDetectionStatus::OutOfEar, EarDetectionStatus::OutOfEar),
+        );
+        update_snapshot(
+            &mut snap,
+            &mk(EarDetectionStatus::InEar, EarDetectionStatus::InEar),
+        );
+        assert_eq!(count_aacp(&snap, MAC_A), 1);
+        match &snap[0] {
+            AppEvent::AACPEvent(_, ae) => match &**ae {
+                AE::EarDetection {
+                    new_left,
+                    new_right,
+                    ..
+                } => {
+                    assert_eq!(*new_left, Some(EarDetectionStatus::InEar));
+                    assert_eq!(*new_right, Some(EarDetectionStatus::InEar));
+                }
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn snapshot_replaces_connected_devices_per_device() {
+        let mut snap = Vec::new();
+        let mk = |peers: Vec<ConnectedDevice>| {
+            AppEvent::AACPEvent(MAC_A.into(), Box::new(AE::ConnectedDevices(vec![], peers)))
+        };
+        update_snapshot(
+            &mut snap,
+            &mk(vec![ConnectedDevice {
+                mac: "11:22:33:44:55:66".into(),
+                info1: 0,
+                info2: 0,
+            }]),
+        );
+        update_snapshot(&mut snap, &mk(vec![]));
+        assert_eq!(count_aacp(&snap, MAC_A), 1);
+    }
+
+    #[test]
+    fn snapshot_audio_unavailable_dedupes() {
+        let mut snap = Vec::new();
+        update_snapshot(&mut snap, &AppEvent::AudioUnavailable);
+        update_snapshot(&mut snap, &AppEvent::AudioUnavailable);
+        update_snapshot(&mut snap, &AppEvent::AudioUnavailable);
+        assert_eq!(
+            snap.iter()
+                .filter(|e| matches!(e, AppEvent::AudioUnavailable))
+                .count(),
+            1
+        );
     }
 }

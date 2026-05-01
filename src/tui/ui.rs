@@ -55,7 +55,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     {
         draw_info_popup(f, area, state);
     }
-
 }
 
 fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
@@ -93,8 +92,12 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_content(f: &mut Frame, area: Rect, app: &App) {
-    let Some(mac) = app.selected_mac() else { return };
-    let Some(device) = app.devices.get(mac) else { return };
+    let Some(mac) = app.selected_mac() else {
+        return;
+    };
+    let Some(device) = app.devices.get(mac) else {
+        return;
+    };
     match device {
         DeviceState::AirPods(state) => draw_airpods(f, area, state, app),
     }
@@ -121,8 +124,8 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),              // name line
-                Constraint::Length(bat_count + 2),   // battery box
+                Constraint::Length(1),             // name line
+                Constraint::Length(bat_count + 2), // battery box
                 Constraint::Fill(1),
             ])
             .split(area);
@@ -143,10 +146,10 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                    // name line
-            Constraint::Length(bat_count + 2),         // Battery box
-            Constraint::Length(noise_count + 2),       // Noise Control box
-            Constraint::Fill(1),                      // Settings box
+            Constraint::Length(1),               // name line
+            Constraint::Length(bat_count + 2),   // Battery box
+            Constraint::Length(noise_count + 2), // Noise Control box
+            Constraint::Fill(1),                 // Settings box
         ])
         .split(area);
 
@@ -173,7 +176,6 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
     let st_inner = st_block.inner(chunks[3]);
     f.render_widget(st_block, chunks[3]);
     draw_settings_table(f, st_inner, &settings_items, app.section_row, st_focused);
-
 }
 
 fn draw_battery_box(f: &mut Frame, area: Rect, entries: &[(&str, u8, BatteryStatus)]) {
@@ -276,10 +278,13 @@ fn draw_settings_table(
                         .alignment(Alignment::Right),
                     ])
                 }
-                SettingsItem::Enum { label, value, options, .. } => {
-                    let val_str = options
-                        .get(*value as usize)
-                        .unwrap_or(&"?");
+                SettingsItem::Enum {
+                    label,
+                    value,
+                    options,
+                    ..
+                } => {
+                    let val_str = options.get(*value as usize).unwrap_or(&"?");
                     Row::new(vec![
                         Line::from(vec![cursor, Span::styled(*label, label_style)]),
                         Line::from(Span::styled(
@@ -289,13 +294,24 @@ fn draw_settings_table(
                         .alignment(Alignment::Right),
                     ])
                 }
-                SettingsItem::Slider { label, value, min, max, .. } => {
+                SettingsItem::Slider {
+                    label,
+                    value,
+                    min,
+                    max,
+                    ..
+                } => {
                     let range = (*max - *min) as usize;
                     let filled = ((*value - *min) as usize * 10)
                         .checked_div(range)
                         .unwrap_or(0)
                         .min(10);
-                    let bar = format!("{}{}  {:>3}%", "█".repeat(filled), "░".repeat(10 - filled), value);
+                    let bar = format!(
+                        "{}{}  {:>3}%",
+                        "█".repeat(filled),
+                        "░".repeat(10 - filled),
+                        value
+                    );
                     Row::new(vec![
                         Line::from(vec![cursor, Span::styled(*label, label_style)]),
                         Line::from(Span::styled(
@@ -309,10 +325,7 @@ fn draw_settings_table(
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [Constraint::Fill(1), Constraint::Length(20)],
-    );
+    let table = Table::new(rows, [Constraint::Fill(1), Constraint::Length(20)]);
 
     let mut table_state = TableState::default();
     if focused {
@@ -411,10 +424,16 @@ fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'
     let mut spans = vec![
         Span::styled(format!("  {}", label), Style::default().fg(DIM)),
         Span::styled(format!("{}  ", bar), Style::default().fg(color)),
-        Span::styled(format!("{:>3}%", level), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:>3}%", level),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
     ];
     if charging {
-        spans.push(Span::styled("  [charging]", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            "  [charging]",
+            Style::default().fg(Color::Cyan),
+        ));
     }
     Paragraph::new(Line::from(spans))
 }
@@ -437,9 +456,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" info", Style::default().fg(DIM)),
     ];
     if app.audio_unavailable {
-        spans.push(Span::styled("  PulseAudio unavailable", Style::default().fg(Color::Red)));
+        spans.push(Span::styled(
+            "  PulseAudio unavailable",
+            Style::default().fg(Color::Red),
+        ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), area);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
@@ -490,12 +515,12 @@ fn draw_rename_popup(f: &mut Frame, area: Rect, buf: &str) {
 
 fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
     let fields: Vec<(&str, Option<&str>)> = vec![
-        ("Model",     state.model.as_deref()),
-        ("Firmware",  state.firmware.as_deref()),
-        ("Hardware",  state.hardware_revision.as_deref()),
-        ("Serial",    state.serial_number.as_deref()),
-        ("L Serial",  state.left_serial.as_deref()),
-        ("R Serial",  state.right_serial.as_deref()),
+        ("Model", state.model.as_deref()),
+        ("Firmware", state.firmware.as_deref()),
+        ("Hardware", state.hardware_revision.as_deref()),
+        ("Serial", state.serial_number.as_deref()),
+        ("L Serial", state.left_serial.as_deref()),
+        ("R Serial", state.right_serial.as_deref()),
     ];
     let row_count = fields.iter().filter(|(_, v)| v.is_some()).count() as u16;
     let popup_h = row_count + 2; // +2 for border
@@ -590,4 +615,65 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noise_mode_list_minimal() {
+        let m = noise_mode_list(false, false);
+        assert_eq!(
+            m,
+            vec![
+                AirPodsNoiseControlMode::Transparency,
+                AirPodsNoiseControlMode::NoiseCancellation,
+            ]
+        );
+    }
+
+    #[test]
+    fn noise_mode_list_with_adaptive() {
+        let m = noise_mode_list(true, false);
+        assert_eq!(
+            m,
+            vec![
+                AirPodsNoiseControlMode::Transparency,
+                AirPodsNoiseControlMode::Adaptive,
+                AirPodsNoiseControlMode::NoiseCancellation,
+            ]
+        );
+    }
+
+    #[test]
+    fn noise_mode_list_with_off() {
+        let m = noise_mode_list(false, true);
+        assert_eq!(
+            m,
+            vec![
+                AirPodsNoiseControlMode::Transparency,
+                AirPodsNoiseControlMode::NoiseCancellation,
+                AirPodsNoiseControlMode::Off,
+            ]
+        );
+    }
+
+    #[test]
+    fn noise_mode_list_full() {
+        let m = noise_mode_list(true, true);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m[0], AirPodsNoiseControlMode::Transparency);
+        assert_eq!(m[1], AirPodsNoiseControlMode::Adaptive);
+        assert_eq!(m[2], AirPodsNoiseControlMode::NoiseCancellation);
+        assert_eq!(m[3], AirPodsNoiseControlMode::Off);
+    }
+
+    #[test]
+    fn noise_mode_list_order_is_stable() {
+        // Activate-noise-row in events.rs maps section_row index to this list.
+        // Transparency must be first so key('1') and row 0 align with it.
+        let m = noise_mode_list(true, true);
+        assert_eq!(m[0], AirPodsNoiseControlMode::Transparency);
+    }
 }

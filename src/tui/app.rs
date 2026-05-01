@@ -1,4 +1,7 @@
-use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryStatus, ConnectedDevice, ControlCommandIdentifiers, EarDetectionStatus};
+use crate::bluetooth::aacp::{
+    AACPEvent, BatteryComponent, BatteryStatus, ConnectedDevice, ControlCommandIdentifiers,
+    EarDetectionStatus,
+};
 use crate::devices::enums::AirPodsNoiseControlMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +15,11 @@ pub enum DeviceCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppEvent {
-    DeviceConnected { mac: String, name: String, product_id: u16 },
+    DeviceConnected {
+        mac: String,
+        name: String,
+        product_id: u16,
+    },
     DeviceDisconnected(String),
     AACPEvent(String, Box<crate::bluetooth::aacp::AACPEvent>),
     AudioUnavailable,
@@ -269,7 +276,11 @@ impl App {
     /// Handle a single AppEvent and update state.
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::DeviceConnected { mac, name, product_id } => {
+            AppEvent::DeviceConnected {
+                mac,
+                name,
+                product_id,
+            } => {
                 if self.devices.contains_key(&mac) {
                     if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(&mac) {
                         s.name = name;
@@ -299,7 +310,9 @@ impl App {
             AppEvent::DeviceDisconnected(mac) => {
                 self.devices.remove(&mac);
                 self.device_order.retain(|m| m != &mac);
-                if self.selected_device_idx >= self.device_order.len() && !self.device_order.is_empty() {
+                if self.selected_device_idx >= self.device_order.len()
+                    && !self.device_order.is_empty()
+                {
                     self.selected_device_idx = self.device_order.len() - 1;
                 }
             }
@@ -330,7 +343,8 @@ impl App {
         }
 
         if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(mac)
-            && s.name == mac {
+            && s.name == mac
+        {
             s.name = "AirPods".to_string();
         }
 
@@ -362,7 +376,12 @@ impl App {
                     let bat_headphone = state.battery_headphone.map(|(h, _)| h);
                     // Write battery env file in a background thread to avoid blocking the TUI loop
                     std::thread::spawn(move || {
-                        crate::utils::write_battery_env(bat_left, bat_right, bat_case, bat_headphone);
+                        crate::utils::write_battery_env(
+                            bat_left,
+                            bat_right,
+                            bat_case,
+                            bat_headphone,
+                        );
                     });
                 }
                 AACPEvent::DeviceInfo(info) => {
@@ -387,7 +406,11 @@ impl App {
                         state.right_serial = Some(info.right_serial_number);
                     }
                 }
-                AACPEvent::EarDetection { new_left, new_right, .. } => {
+                AACPEvent::EarDetection {
+                    new_left,
+                    new_right,
+                    ..
+                } => {
                     state.ear_left = new_left;
                     state.ear_right = new_right;
                 }
@@ -510,4 +533,411 @@ pub enum SettingsItem {
         max: u8,
         cmd: ControlCommandIdentifiers,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bluetooth::aacp::{
+        AACPEvent as AE, BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
+        ControlCommandStatus, EarDetectionStatus,
+    };
+    use tokio::sync::mpsc;
+
+    const MAC: &str = "AA:BB:CC:DD:EE:FF";
+    const PRO2: u16 = 0x2014; // ANC + Adaptive + Stem + CA
+    const AIRPODS3: u16 = 0x2013; // No ANC, has stem
+    const MAX: u16 = 0x200a; // ANC, no stem
+
+    /// Build an App with a wired command channel and discardable rx.
+    fn mk_app() -> (App, mpsc::UnboundedReceiver<(String, DeviceCommand)>) {
+        let (_event_tx, event_rx) = mpsc::unbounded_channel::<AppEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        (App::new(event_rx, cmd_tx), cmd_rx)
+    }
+
+    fn connected(mac: &str, name: &str, product_id: u16) -> AppEvent {
+        AppEvent::DeviceConnected {
+            mac: mac.into(),
+            name: name.into(),
+            product_id,
+        }
+    }
+
+    fn aacp(mac: &str, e: AE) -> AppEvent {
+        AppEvent::AACPEvent(mac.into(), Box::new(e))
+    }
+
+    fn airpods<'a>(app: &'a App, mac: &str) -> &'a AirPodsDeviceState {
+        match app.devices.get(mac) {
+            Some(DeviceState::AirPods(s)) => s,
+            _ => panic!("no AirPods state for {}", mac),
+        }
+    }
+
+    #[test]
+    fn focused_section_cycles_two_states() {
+        assert_eq!(
+            FocusedSection::NoiseControl.next(),
+            FocusedSection::Settings
+        );
+        assert_eq!(
+            FocusedSection::Settings.next(),
+            FocusedSection::NoiseControl
+        );
+        assert_eq!(
+            FocusedSection::NoiseControl.prev(),
+            FocusedSection::Settings
+        );
+        assert_eq!(
+            FocusedSection::Settings.prev(),
+            FocusedSection::NoiseControl
+        );
+    }
+
+    #[test]
+    fn device_connected_creates_state_with_model_info() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "MyPods", PRO2));
+        assert_eq!(app.device_order, vec![MAC]);
+        let s = airpods(&app, MAC);
+        assert_eq!(s.name, "MyPods");
+        assert_eq!(s.product_id, PRO2);
+        assert!(s.has_anc);
+        assert!(s.has_adaptive);
+        assert_eq!(s.model.as_deref(), Some("AirPods Pro 2"));
+    }
+
+    #[test]
+    fn device_connected_zero_product_id_keeps_model_unset() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "MyPods", 0));
+        let s = airpods(&app, MAC);
+        assert!(s.model.is_none());
+    }
+
+    #[test]
+    fn second_connect_with_real_product_id_backfills_model() {
+        let (mut app, _) = mk_app();
+        // AACP event arrives before DeviceConnected (race); state is created with defaults
+        app.handle_event(aacp(MAC, AE::BatteryInfo(vec![])));
+        let s = airpods(&app, MAC);
+        assert_eq!(s.product_id, 0);
+
+        // Now the proper DeviceConnected arrives
+        app.handle_event(connected(MAC, "MyPods", PRO2));
+        let s = airpods(&app, MAC);
+        assert_eq!(s.product_id, PRO2);
+        assert!(s.has_adaptive);
+        assert_eq!(s.model.as_deref(), Some("AirPods Pro 2"));
+    }
+
+    #[test]
+    fn device_disconnected_removes_and_clamps_index() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected("A", "a", PRO2));
+        app.handle_event(connected("B", "b", PRO2));
+        app.selected_device_idx = 1;
+        app.handle_event(AppEvent::DeviceDisconnected("B".into()));
+        assert_eq!(app.device_order, vec!["A".to_string()]);
+        assert_eq!(app.selected_device_idx, 0);
+    }
+
+    #[test]
+    fn battery_info_populates_components() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(
+            MAC,
+            AE::BatteryInfo(vec![
+                BatteryInfo {
+                    component: BatteryComponent::Left,
+                    level: 80,
+                    status: BatteryStatus::NotCharging,
+                },
+                BatteryInfo {
+                    component: BatteryComponent::Right,
+                    level: 70,
+                    status: BatteryStatus::Charging,
+                },
+                BatteryInfo {
+                    component: BatteryComponent::Case,
+                    level: 50,
+                    status: BatteryStatus::NotCharging,
+                },
+            ]),
+        ));
+        let s = airpods(&app, MAC);
+        assert_eq!(s.battery_left, Some((80, BatteryStatus::NotCharging)));
+        assert_eq!(s.battery_right, Some((70, BatteryStatus::Charging)));
+        assert_eq!(s.battery_case, Some((50, BatteryStatus::NotCharging)));
+    }
+
+    #[test]
+    fn case_battery_disconnected_does_not_clobber_previous() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(
+            MAC,
+            AE::BatteryInfo(vec![BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 40,
+                status: BatteryStatus::NotCharging,
+            }]),
+        ));
+        app.handle_event(aacp(
+            MAC,
+            AE::BatteryInfo(vec![BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 0,
+                status: BatteryStatus::Disconnected,
+            }]),
+        ));
+        assert_eq!(
+            airpods(&app, MAC).battery_case,
+            Some((40, BatteryStatus::NotCharging))
+        );
+    }
+
+    #[test]
+    fn ear_detection_event_updates_state() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(
+            MAC,
+            AE::EarDetection {
+                old_left: None,
+                old_right: None,
+                new_left: Some(EarDetectionStatus::InEar),
+                new_right: Some(EarDetectionStatus::OutOfEar),
+            },
+        ));
+        let s = airpods(&app, MAC);
+        assert_eq!(s.ear_left, Some(EarDetectionStatus::InEar));
+        assert_eq!(s.ear_right, Some(EarDetectionStatus::OutOfEar));
+    }
+
+    #[test]
+    fn eq_data_event_stores_bands() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(MAC, AE::EqData([1, 2, 3, 4, 5, 6, 7, 8])));
+        assert_eq!(airpods(&app, MAC).eq_bands, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    fn cc(id: ControlCommandIdentifiers, val: u8) -> AE {
+        AE::ControlCommand(ControlCommandStatus {
+            identifier: id,
+            value: vec![val],
+        })
+    }
+
+    #[test]
+    fn control_command_listening_mode_decoded() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::ListeningMode, 0x03),
+        ));
+        assert_eq!(
+            airpods(&app, MAC).listening_mode,
+            AirPodsNoiseControlMode::Transparency
+        );
+    }
+
+    #[test]
+    fn control_command_mic_mode_decrements_to_zero_indexed() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(MAC, cc(ControlCommandIdentifiers::MicMode, 0x03)));
+        // wire 0x03 (Auto) → stored 2
+        assert_eq!(airpods(&app, MAC).mic_mode, Some(2));
+    }
+
+    #[test]
+    fn control_command_toggles_set_correct_booleans() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::ConversationDetectConfig, 0x01),
+        ));
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::OneBudAncMode, 0x01),
+        ));
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::AdaptiveVolumeConfig, 0x01),
+        ));
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::AllowOffOption, 0x01),
+        ));
+        let s = airpods(&app, MAC);
+        assert!(s.conversation_awareness);
+        assert!(s.one_bud_anc);
+        assert!(s.adaptive_volume);
+        assert!(s.allow_off_mode);
+    }
+
+    #[test]
+    fn settings_items_for_pro2_includes_stem_and_ca() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        let labels: Vec<&str> = app
+            .settings_items()
+            .iter()
+            .map(|i| match i {
+                SettingsItem::Toggle { label, .. } => *label,
+                SettingsItem::Enum { label, .. } => *label,
+                SettingsItem::Slider { label, .. } => *label,
+            })
+            .collect();
+        assert!(labels.contains(&"Conversation Awareness"));
+        assert!(labels.contains(&"NC with One AirPod"));
+        assert!(labels.contains(&"Press Speed"));
+        assert!(labels.contains(&"Volume Swipe Length"));
+        assert!(labels.contains(&"Mic Mode"));
+    }
+
+    #[test]
+    fn settings_items_for_airpods3_no_anc_skips_anc_specific() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", AIRPODS3));
+        let labels: Vec<&str> = app
+            .settings_items()
+            .iter()
+            .map(|i| match i {
+                SettingsItem::Toggle { label, .. } => *label,
+                SettingsItem::Enum { label, .. } => *label,
+                SettingsItem::Slider { label, .. } => *label,
+            })
+            .collect();
+        // No ANC → no Conversation Awareness, no One-Bud ANC
+        assert!(!labels.contains(&"Conversation Awareness"));
+        assert!(!labels.contains(&"NC with One AirPod"));
+        // Has stem → Press Speed appears
+        assert!(labels.contains(&"Press Speed"));
+    }
+
+    #[test]
+    fn settings_items_for_max_no_stem_skips_stem_items() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Max", MAX));
+        let labels: Vec<&str> = app
+            .settings_items()
+            .iter()
+            .map(|i| match i {
+                SettingsItem::Toggle { label, .. } => *label,
+                SettingsItem::Enum { label, .. } => *label,
+                SettingsItem::Slider { label, .. } => *label,
+            })
+            .collect();
+        assert!(!labels.contains(&"Press Speed"));
+        assert!(!labels.contains(&"Volume Swipe"));
+        assert!(!labels.contains(&"Volume Swipe Length"));
+    }
+
+    #[test]
+    fn adaptive_noise_slider_only_when_adaptive_mode_active() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        // Default listening mode is NoiseCancellation → no adaptive slider
+        let labels: Vec<&str> = app
+            .settings_items()
+            .iter()
+            .map(|i| match i {
+                SettingsItem::Slider { label, .. } => *label,
+                _ => "",
+            })
+            .collect();
+        assert!(!labels.contains(&"Adaptive Noise Level"));
+
+        // Switch to Adaptive
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::ListeningMode, 0x04),
+        ));
+        let labels: Vec<&str> = app
+            .settings_items()
+            .iter()
+            .map(|i| match i {
+                SettingsItem::Slider { label, .. } => *label,
+                _ => "",
+            })
+            .collect();
+        assert!(labels.contains(&"Adaptive Noise Level"));
+    }
+
+    #[test]
+    fn noise_control_rows_zero_when_no_anc() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", AIRPODS3));
+        assert_eq!(app.noise_control_rows(), 0);
+    }
+
+    #[test]
+    fn noise_control_rows_grows_with_options() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        // Default: has_adaptive=true, allow_off=false → 3 rows (Trans, Adaptive, NC)
+        assert_eq!(app.noise_control_rows(), 3);
+        // Enable allow_off via control command
+        app.handle_event(aacp(
+            MAC,
+            cc(ControlCommandIdentifiers::AllowOffOption, 0x01),
+        ));
+        assert_eq!(app.noise_control_rows(), 4);
+    }
+
+    #[test]
+    fn send_command_emits_on_channel() {
+        let (app, mut cmd_rx) = mk_app();
+        app.send_command(MAC, ControlCommandIdentifiers::ListeningMode, vec![0x02]);
+        let received = cmd_rx.try_recv().expect("command emitted");
+        assert_eq!(received.0, MAC);
+        match received.1 {
+            DeviceCommand::ControlCommand(id, val) => {
+                assert_eq!(id, ControlCommandIdentifiers::ListeningMode);
+                assert_eq!(val, vec![0x02]);
+            }
+            _ => panic!("expected ControlCommand"),
+        }
+    }
+
+    #[test]
+    fn send_rename_emits_rename_command() {
+        let (app, mut cmd_rx) = mk_app();
+        app.send_rename(MAC, "NewName".into());
+        let received = cmd_rx.try_recv().expect("rename emitted");
+        assert!(matches!(received.1, DeviceCommand::Rename(ref n) if n == "NewName"));
+    }
+
+    #[test]
+    fn audio_unavailable_event_sets_flag() {
+        let (mut app, _) = mk_app();
+        assert!(!app.audio_unavailable);
+        app.handle_event(AppEvent::AudioUnavailable);
+        assert!(app.audio_unavailable);
+    }
+
+    #[test]
+    fn aacp_event_for_unknown_mac_creates_default_state() {
+        let (mut app, _) = mk_app();
+        // Events arrive before DeviceConnected — App should fabricate a state
+        app.handle_event(aacp(
+            MAC,
+            AE::BatteryInfo(vec![BatteryInfo {
+                component: BatteryComponent::Left,
+                level: 50,
+                status: BatteryStatus::NotCharging,
+            }]),
+        ));
+        assert_eq!(app.device_order, vec![MAC]);
+        let s = airpods(&app, MAC);
+        assert_eq!(s.name, "AirPods");
+        assert_eq!(s.battery_left, Some((50, BatteryStatus::NotCharging)));
+    }
 }

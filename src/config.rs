@@ -33,11 +33,7 @@ impl Default for Config {
                 "{}".into(),
             ],
             restart_audio_server: None,
-            battery_alert_command: vec![
-                "notify-send".into(),
-                "AirPods".into(),
-                "{}".into(),
-            ],
+            battery_alert_command: vec!["notify-send".into(), "AirPods".into(), "{}".into()],
         }
     }
 }
@@ -124,6 +120,39 @@ volume_set_command = ["echo", "{}"]
     fn config_uses_defaults_for_missing_fields() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.volume_osd_command, Config::default().volume_osd_command);
-        assert_eq!(cfg.battery_alert_command, Config::default().battery_alert_command);
+        assert_eq!(
+            cfg.battery_alert_command,
+            Config::default().battery_alert_command
+        );
+    }
+
+    #[test]
+    fn config_can_disable_battery_alert_with_empty_array() {
+        let cfg: Config = toml::from_str("battery_alert_command = []").unwrap();
+        assert!(cfg.battery_alert_command.is_empty());
+    }
+
+    #[test]
+    fn config_can_set_restart_audio_server() {
+        let cfg: Config = toml::from_str(
+            r#"restart_audio_server = ["systemctl", "--user", "restart", "wireplumber"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.restart_audio_server,
+            Some(vec![
+                "systemctl".into(),
+                "--user".into(),
+                "restart".into(),
+                "wireplumber".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn run_template_cmd_with_empty_template_does_not_spawn() {
+        // No assertion needed beyond "doesn't panic"; an empty template must early-return
+        // before std::process::Command would be invoked with index 0.
+        run_template_cmd(&[], "anything");
     }
 }

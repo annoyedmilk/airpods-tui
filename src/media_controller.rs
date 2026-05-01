@@ -268,7 +268,8 @@ fn pa_get_device_index(mainloop: &mut Mainloop, context: &Context, mac: &str) ->
     let cards = pa_get_card_info_list(mainloop, context);
     for card in &cards {
         if let Some(device_string) = card.proplist.get_str("device.string")
-            && device_string.contains(mac) {
+            && device_string.contains(mac)
+        {
             return Some(card.index);
         }
     }
@@ -297,7 +298,11 @@ fn pa_set_default_sink(mainloop: &mut Mainloop, context: &mut Context, sink_name
     true
 }
 
-fn pa_move_all_sink_inputs(mainloop: &mut Mainloop, context: &mut Context, sink_name: &str) -> bool {
+fn pa_move_all_sink_inputs(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    sink_name: &str,
+) -> bool {
     let indices = Rc::new(RefCell::new(Vec::<u32>::new()));
     let op = context.introspect().get_sink_input_info_list({
         let indices = indices.clone();
@@ -440,8 +445,7 @@ fn pa_transition_volume(
     if let Some(sink_info) = sink_info_option.borrow().as_ref() {
         let channels = sink_info.volume.len();
         let mut new_volumes = ChannelVolumes::default();
-        let raw =
-            (((target_volume as f64) / 100.0) * (Volume::NORMAL.0 as f64)).round() as u32;
+        let raw = (((target_volume as f64) / 100.0) * (Volume::NORMAL.0 as f64)).round() as u32;
         let vol = Volume(raw);
         new_volumes.set(channels, vol);
 
@@ -457,7 +461,11 @@ fn pa_transition_volume(
     }
 }
 
-fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str) -> Option<String> {
+fn pa_get_sink_name_by_mac(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    mac: &str,
+) -> Option<String> {
     let introspector = context.introspect();
     let sink_info_list = Rc::new(RefCell::new(Some(Vec::new())));
     let op = introspector.get_sink_info_list({
@@ -484,10 +492,9 @@ fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str
     if let Some(list) = sink_info_list.borrow().as_ref() {
         for sink in list {
             if let Some(device_string) = sink.proplist.get_str("device.string")
-                && device_string
-                    .to_uppercase()
-                    .contains(&mac.to_uppercase())
-                && let Some(name) = &sink.name {
+                && device_string.to_uppercase().contains(&mac.to_uppercase())
+                && let Some(name) = &sink.name
+            {
                 return Some(name.to_string());
             }
             if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
@@ -498,7 +505,8 @@ fn pa_get_sink_name_by_mac(mainloop: &mut Mainloop, context: &Context, mac: &str
                     .replace("dev_", "")
                     .replace('_', ":");
                 if mac_from_path.eq_ignore_ascii_case(mac)
-                    && let Some(name) = &sink.name {
+                    && let Some(name) = &sink.name
+                {
                     return Some(name.to_string());
                 }
             }
@@ -527,10 +535,7 @@ fn pa_is_profile_available(
 
 // ── Async wrappers: send command + await oneshot reply ──
 
-async fn audio_cmd_is_a2dp(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    card_index: u32,
-) -> bool {
+async fn audio_cmd_is_a2dp(tx: &std::sync::mpsc::Sender<AudioCommand>, card_index: u32) -> bool {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(AudioCommand::IsA2dpAvailable {
         card_index,
@@ -832,7 +837,9 @@ impl MediaController {
                         .is_some_and(|s| s.mac.to_uppercase() == local_mac)
                 };
                 if already_owned {
-                    debug!("Playback started but Linux already owns audio per AirPods, no claim needed");
+                    debug!(
+                        "Playback started but Linux already owns audio per AirPods, no claim needed"
+                    );
                     let mut state = self.state.lock().await;
                     state.should_reclaim_on_none = false;
                     continue;
@@ -855,9 +862,15 @@ impl MediaController {
     }
 
     async fn check_if_playing_async(&self) -> bool {
-        let Some(conn) = self.session_conn().await else { return false };
-        let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else { return false };
-        let Ok(names) = proxy.list_names().await else { return false };
+        let Some(conn) = self.session_conn().await else {
+            return false;
+        };
+        let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return false;
+        };
+        let Ok(names) = proxy.list_names().await else {
+            return false;
+        };
 
         for name in names {
             let service = name.as_str();
@@ -872,9 +885,11 @@ impl MediaController {
                 service,
                 "/org/mpris/MediaPlayer2",
                 "org.mpris.MediaPlayer2.Player",
-            ).await
+            )
+            .await
                 && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing" {
+                && status == "Playing"
+            {
                 return true;
             }
         }
@@ -1042,7 +1057,8 @@ impl MediaController {
             warn!("A2DP profile not available, attempting to restart audio server");
             if self.restart_wire_plumber().await {
                 let mut state = self.state.lock().await;
-                state.device_index = audio_cmd_get_device_index(&state.audio_tx, &state.connected_device_mac).await;
+                state.device_index =
+                    audio_cmd_get_device_index(&state.audio_tx, &state.connected_device_mac).await;
                 let new_idx = state.device_index;
                 let audio_tx = state.audio_tx.clone();
                 drop(state);
@@ -1101,19 +1117,34 @@ impl MediaController {
     async fn pause(&self) {
         debug!("Pausing playback");
 
-        let Some(conn) = self.session_conn().await else { return };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
-        let Ok(names) = dbus.list_names().await else { return };
+        let Some(conn) = self.session_conn().await else {
+            return;
+        };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return;
+        };
+        let Ok(names) = dbus.list_names().await else {
+            return;
+        };
         let mut paused_services = Vec::new();
 
         for name in names {
             let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+            if !service.starts_with("org.mpris.MediaPlayer2.")
+                || Self::is_kdeconnect_service(service)
+            {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
+            if let Ok(p) = zbus::Proxy::new(
+                &conn,
+                service,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            )
+            .await
                 && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing" {
+                && status == "Playing"
+            {
                 if p.call_noreply("Pause", &()).await.is_ok() {
                     info!("Paused playback for: {}", service);
                     paused_services.push(service.to_string());
@@ -1134,16 +1165,31 @@ impl MediaController {
     }
 
     async fn mpris_call_first(&self, method: &str) {
-        let Some(conn) = self.session_conn().await else { return };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
-        let Ok(names) = dbus.list_names().await else { return };
+        let Some(conn) = self.session_conn().await else {
+            return;
+        };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return;
+        };
+        let Ok(names) = dbus.list_names().await else {
+            return;
+        };
         for name in names {
             let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+            if !service.starts_with("org.mpris.MediaPlayer2.")
+                || Self::is_kdeconnect_service(service)
+            {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
-                && p.call_noreply(method, &()).await.is_ok() {
+            if let Ok(p) = zbus::Proxy::new(
+                &conn,
+                service,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            )
+            .await
+                && p.call_noreply(method, &()).await.is_ok()
+            {
                 info!("{} for: {}", method, service);
                 break;
             }
@@ -1168,19 +1214,34 @@ impl MediaController {
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
 
-        let Some(conn) = self.session_conn().await else { return };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else { return };
-        let Ok(names) = dbus.list_names().await else { return };
+        let Some(conn) = self.session_conn().await else {
+            return;
+        };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return;
+        };
+        let Ok(names) = dbus.list_names().await else {
+            return;
+        };
         let mut paused_count = 0;
 
         for name in names {
             let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.") || Self::is_kdeconnect_service(service) {
+            if !service.starts_with("org.mpris.MediaPlayer2.")
+                || Self::is_kdeconnect_service(service)
+            {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await
+            if let Ok(p) = zbus::Proxy::new(
+                &conn,
+                service,
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            )
+            .await
                 && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing" {
+                && status == "Playing"
+            {
                 if p.call_noreply("Pause", &()).await.is_ok() {
                     info!("Paused playback for: {}", service);
                     paused_count += 1;
@@ -1254,7 +1315,7 @@ impl MediaController {
             let source_is_none = source.r#type == AudioSourceType::None;
 
             // Keep current_audio_source as the *last non-None* source. None
-                        // packets do not clear it. This matches xatuke/handoff and keeps
+            // packets do not clear it. This matches xatuke/handoff and keeps
             // peer-vs-local ownership reliable across the AirPods' transient
             // None blips during handoff.
             if !source_is_none {
@@ -1352,7 +1413,10 @@ impl MediaController {
             return;
         };
 
-        info!("Forcing AVDTP_START via sink suspend/resume on {}", sink_name);
+        info!(
+            "Forcing AVDTP_START via sink suspend/resume on {}",
+            sink_name
+        );
         if !audio_cmd_suspend_sink(&audio_tx, &sink_name, true).await {
             warn!("PulseAudio suspend failed, falling back to profile cycle");
             self.activate_a2dp_profile().await;
@@ -1378,13 +1442,22 @@ impl MediaController {
             return;
         }
 
-        let Some(conn) = self.session_conn().await else { return };
+        let Some(conn) = self.session_conn().await else {
+            return;
+        };
         let mut resumed_count = 0;
         for service in &services {
             if Self::is_kdeconnect_service(service) {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(&conn, service.as_str(), "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await {
+            if let Ok(p) = zbus::Proxy::new(
+                &conn,
+                service.as_str(),
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+            )
+            .await
+            {
                 if p.call_noreply("Play", &()).await.is_ok() {
                     info!("Resumed playback for: {}", service);
                     resumed_count += 1;
@@ -1450,9 +1523,7 @@ impl MediaController {
         };
 
         info!("Restarting audio server: {:?}", cmd);
-        let result = std::process::Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .output();
+        let result = std::process::Command::new(&cmd[0]).args(&cmd[1..]).output();
 
         match result {
             Ok(output) if output.status.success() => {
@@ -1548,7 +1619,8 @@ impl MediaController {
                     state.conv_original_volume
                 };
                 if let Some(orig) = original
-                    && orig > 15 {
+                    && orig > 15
+                {
                     audio_cmd_transition_volume(&audio_tx, &sink, 15).await;
                     info!(
                         "Conversation reduce: lowered volume to 15% (original {})",
@@ -1599,7 +1671,10 @@ impl MediaController {
                 }
                 if let Some(orig) = maybe_original {
                     audio_cmd_transition_volume(&audio_tx, &sink, orig).await;
-                    info!("Conversation end ({}): restored volume to original {}", status, orig);
+                    info!(
+                        "Conversation end ({}): restored volume to original {}",
+                        status, orig
+                    );
                 }
             }
             _ => {

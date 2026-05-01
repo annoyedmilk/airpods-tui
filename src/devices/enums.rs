@@ -66,3 +66,51 @@ impl AirPodsNoiseControlMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noise_mode_byte_roundtrip() {
+        for m in [
+            AirPodsNoiseControlMode::Off,
+            AirPodsNoiseControlMode::NoiseCancellation,
+            AirPodsNoiseControlMode::Transparency,
+            AirPodsNoiseControlMode::Adaptive,
+        ] {
+            assert_eq!(AirPodsNoiseControlMode::from_byte(m.to_byte()), m);
+        }
+    }
+
+    #[test]
+    fn noise_mode_unknown_byte_falls_back_to_off() {
+        assert_eq!(
+            AirPodsNoiseControlMode::from_byte(0xFF),
+            AirPodsNoiseControlMode::Off
+        );
+        assert_eq!(
+            AirPodsNoiseControlMode::from_byte(0x00),
+            AirPodsNoiseControlMode::Off
+        );
+    }
+
+    #[test]
+    fn noise_mode_display_human_readable() {
+        assert_eq!(
+            AirPodsNoiseControlMode::NoiseCancellation.to_string(),
+            "Noise Cancellation"
+        );
+        assert_eq!(AirPodsNoiseControlMode::Adaptive.to_string(), "Adaptive");
+        assert_eq!(AirPodsNoiseControlMode::Off.to_string(), "Off");
+        assert_eq!(
+            AirPodsNoiseControlMode::Transparency.to_string(),
+            "Transparency"
+        );
+    }
+
+    #[test]
+    fn device_type_display() {
+        assert_eq!(DeviceType::AirPods.to_string(), "AirPods");
+    }
+}

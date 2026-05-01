@@ -651,8 +651,7 @@ impl AACPManager {
                 let ss = parse_status(secondary_status);
 
                 let mut state = self.state.lock().await;
-                let right_is_primary =
-                    state.primary_pod == Some(BatteryComponent::Right);
+                let right_is_primary = state.primary_pod == Some(BatteryComponent::Right);
                 let (left, right) = if right_is_primary {
                     (ss, ps) // index 0 = right, index 1 = left
                 } else {
@@ -721,7 +720,9 @@ impl AACPManager {
                         strings.push(s.to_string());
                     }
                 }
-                if !strings.is_empty() { strings.remove(0); }
+                if !strings.is_empty() {
+                    strings.remove(0);
+                }
                 let info = AirPodsInformation {
                     name: strings.first().cloned().unwrap_or_default(),
                     model_number: strings.get(1).cloned().unwrap_or_default(),
@@ -808,22 +809,31 @@ impl AACPManager {
                 let mut state = self.state.lock().await;
                 for (key_type, key_data) in &keys {
                     if let Ok(kt) = ProximityKeyType::try_from(*key_type)
-                        && let Some(mac) = state.airpods_mac {
-                            let mac_str = mac.to_string();
-                            let device_data =
-                                state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                    name: mac_str.clone(),
-                                    type_: DeviceType::AirPods,
-                                    information: None,
-                                });
-                            match kt {
-                                ProximityKeyType::Irk => if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
+                        && let Some(mac) = state.airpods_mac
+                    {
+                        let mac_str = mac.to_string();
+                        let device_data =
+                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
+                                name: mac_str.clone(),
+                                type_: DeviceType::AirPods,
+                                information: None,
+                            });
+                        match kt {
+                            ProximityKeyType::Irk => {
+                                if let Some(DeviceInformation::AirPods(info)) =
+                                    device_data.information.as_mut()
+                                {
                                     info.le_keys.irk = hex::encode(key_data);
-                                },
-                                ProximityKeyType::EncKey => if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
-                                    info.le_keys.enc_key = hex::encode(key_data);
-                                },
+                                }
                             }
+                            ProximityKeyType::EncKey => {
+                                if let Some(DeviceInformation::AirPods(info)) =
+                                    device_data.information.as_mut()
+                                {
+                                    info.le_keys.enc_key = hex::encode(key_data);
+                                }
+                            }
+                        }
                     }
                 }
                 let Ok(json) = serde_json::to_string(&state.devices) else {
@@ -853,9 +863,15 @@ impl AACPManager {
                     0x02 => Some(StemPressBudType::Right),
                     _ => None,
                 });
-                info!("Received Stem Press packet: {:?} bud={:?} raw={}", press_type, bud, hex::encode(payload));
+                info!(
+                    "Received Stem Press packet: {:?} bud={:?} raw={}",
+                    press_type,
+                    bud,
+                    hex::encode(payload)
+                );
                 if let Some(pt) = press_type
-                    && let Some(ref tx) = self.state.lock().await.event_tx {
+                    && let Some(ref tx) = self.state.lock().await.event_tx
+                {
                     let _ = tx.send(AACPEvent::StemPress(pt, bud));
                 }
             }
@@ -1071,4 +1087,580 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
     }
     info!("Send thread finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::time::timeout;
+
+    /// Helper: build a manager wired to an event channel and return both.
+    async fn manager_with_events() -> (AACPManager, UnboundedReceiver<AACPEvent>) {
+        let m = AACPManager::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        m.set_event_channel(tx).await;
+        (m, rx)
+    }
+
+    /// Helper: prepend the standard 4-byte AACP header to a payload.
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut v = HEADER_BYTES.to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Drain an event from the channel within a short window.
+    async fn next_event(rx: &mut UnboundedReceiver<AACPEvent>) -> Option<AACPEvent> {
+        timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn rejects_packet_without_header() {
+        let (m, mut rx) = manager_with_events().await;
+        m.receive_packet(&[0xFF, 0xFF, 0xFF]).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_packet_too_short_for_opcode() {
+        let (m, mut rx) = manager_with_events().await;
+        m.receive_packet(&HEADER_BYTES).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn battery_info_parses_all_components() {
+        let (m, mut rx) = manager_with_events().await;
+        // opcode(0x04) pad count=4 [comp, _, level, status, _]*4
+        let payload = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x04,
+            0x01,
+            0x00,
+            80,
+            0x02,
+            0x00, // headphone 80% NotCharging
+            0x02,
+            0x00,
+            70,
+            0x01,
+            0x00, // right 70% Charging
+            0x04,
+            0x00,
+            60,
+            0x05,
+            0x00, // left 60% InUse
+            0x08,
+            0x00,
+            50,
+            0x02,
+            0x00, // case 50% NotCharging
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        let ev = next_event(&mut rx).await.expect("BatteryInfo emitted");
+        match ev {
+            AACPEvent::BatteryInfo(b) => {
+                assert_eq!(b.len(), 4);
+                let comps: Vec<_> = b.iter().map(|x| x.component).collect();
+                assert!(comps.contains(&BatteryComponent::Headphone));
+                assert!(comps.contains(&BatteryComponent::Right));
+                assert!(comps.contains(&BatteryComponent::Left));
+                assert!(comps.contains(&BatteryComponent::Case));
+                let left = b
+                    .iter()
+                    .find(|x| x.component == BatteryComponent::Left)
+                    .unwrap();
+                assert_eq!(left.level, 60);
+                assert_eq!(left.status, BatteryStatus::InUse);
+                let right = b
+                    .iter()
+                    .find(|x| x.component == BatteryComponent::Right)
+                    .unwrap();
+                assert_eq!(right.status, BatteryStatus::Charging);
+            }
+            other => panic!("expected BatteryInfo, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn battery_info_skips_unknown_status_byte() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x02,
+            0x04,
+            0x00,
+            75,
+            0x02,
+            0x00, // valid: left 75% NotCharging
+            0x02,
+            0x00,
+            50,
+            0xFE,
+            0x00, // invalid status — should be skipped
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::BatteryInfo(b) => {
+                assert_eq!(b.len(), 1);
+                assert_eq!(b[0].component, BatteryComponent::Left);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn battery_info_truncated_packet_does_not_emit() {
+        let (m, mut rx) = manager_with_events().await;
+        // Says count=4 but only one entry's worth of bytes follows
+        let payload = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x04,
+            0x01,
+            0x00,
+            80,
+            0x02,
+            0x00,
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn battery_info_records_primary_pod() {
+        let (m, _rx) = manager_with_events().await;
+        let payload = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x01,
+            0x02,
+            0x00,
+            70,
+            0x02,
+            0x00, // right
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        let state = m.state.lock().await;
+        assert_eq!(state.primary_pod, Some(BatteryComponent::Right));
+    }
+
+    #[tokio::test]
+    async fn control_command_trims_trailing_zeros() {
+        let (m, mut rx) = manager_with_events().await;
+        // opcode pad identifier=ListeningMode(0x0D) value=[0x02, 0x00, 0x00, 0x00]
+        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::ControlCommand(c) => {
+                assert_eq!(c.identifier, ControlCommandIdentifiers::ListeningMode);
+                assert_eq!(c.value, vec![0x02]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_command_all_zero_value_normalizes_to_single_zero() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::ControlCommand(c) => assert_eq!(c.value, vec![0x00]),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_command_unknown_identifier_emits_nothing() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x7F, 0x01, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_command_owns_connection_updates_owns_flag() {
+        let (m, _rx) = manager_with_events().await;
+        // OwnsConnection (0x06) value = 1
+        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(m.state.lock().await.owns);
+
+        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(!m.state.lock().await.owns);
+    }
+
+    #[tokio::test]
+    async fn control_command_replaces_existing_status() {
+        let (m, _rx) = manager_with_events().await;
+        let p1 = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00];
+        let p2 = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&p1)).await;
+        m.receive_packet(&pkt(&p2)).await;
+        let s = m.state.lock().await;
+        let listening: Vec<_> = s
+            .control_command_status_list
+            .iter()
+            .filter(|c| c.identifier == ControlCommandIdentifiers::ListeningMode)
+            .collect();
+        assert_eq!(listening.len(), 1);
+        assert_eq!(listening[0].value, vec![0x03]);
+    }
+
+    #[tokio::test]
+    async fn ear_detection_with_left_primary_passes_through() {
+        let (m, mut rx) = manager_with_events().await;
+        // Force primary pod to Left via a battery packet first
+        let bat = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x01,
+            0x04,
+            0x00,
+            50,
+            0x02,
+            0x00,
+        ];
+        m.receive_packet(&pkt(&bat)).await;
+        let _ = next_event(&mut rx).await; // discard battery event
+
+        // EarDetection: full packet form (header + opcode + filler + L + R)
+        // receive_packet reads packet[6] as primary, packet[7] as secondary
+        let p = [
+            HEADER_BYTES[0],
+            HEADER_BYTES[1],
+            HEADER_BYTES[2],
+            HEADER_BYTES[3],
+            opcodes::EAR_DETECTION,
+            0x00,
+            0x00,
+            0x01, // primary=InEar(0x00), secondary=OutOfEar(0x01)
+        ];
+        m.receive_packet(&p).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::EarDetection {
+                new_left,
+                new_right,
+                ..
+            } => {
+                assert_eq!(new_left, Some(EarDetectionStatus::InEar));
+                assert_eq!(new_right, Some(EarDetectionStatus::OutOfEar));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ear_detection_with_right_primary_swaps() {
+        let (m, mut rx) = manager_with_events().await;
+        // Right is primary → primary byte maps to right, secondary to left
+        let bat = [
+            opcodes::BATTERY_INFO,
+            0x00,
+            0x01,
+            0x02,
+            0x00,
+            50,
+            0x02,
+            0x00,
+        ];
+        m.receive_packet(&pkt(&bat)).await;
+        let _ = next_event(&mut rx).await;
+
+        let p = [
+            HEADER_BYTES[0],
+            HEADER_BYTES[1],
+            HEADER_BYTES[2],
+            HEADER_BYTES[3],
+            opcodes::EAR_DETECTION,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        m.receive_packet(&p).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::EarDetection {
+                new_left,
+                new_right,
+                ..
+            } => {
+                assert_eq!(new_right, Some(EarDetectionStatus::InEar));
+                assert_eq!(new_left, Some(EarDetectionStatus::OutOfEar));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_awareness_parses() {
+        let (m, mut rx) = manager_with_events().await;
+        // Total packet length must equal 10 (header 4 + 6 payload)
+        let p = [
+            HEADER_BYTES[0],
+            HEADER_BYTES[1],
+            HEADER_BYTES[2],
+            HEADER_BYTES[3],
+            opcodes::CONVERSATION_AWARENESS,
+            0,
+            0,
+            0,
+            0,
+            0x01,
+        ];
+        m.receive_packet(&p).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::ConversationalAwareness(s) => assert_eq!(s, 0x01),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_awareness_wrong_length_ignored() {
+        let (m, mut rx) = manager_with_events().await;
+        let p = [
+            HEADER_BYTES[0],
+            HEADER_BYTES[1],
+            HEADER_BYTES[2],
+            HEADER_BYTES[3],
+            opcodes::CONVERSATION_AWARENESS,
+            0,
+            0,
+        ];
+        m.receive_packet(&p).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_source_reverses_mac_byte_order() {
+        let (m, mut rx) = manager_with_events().await;
+        // Payload bytes [2..8] are the MAC in reverse order, byte 8 is the type.
+        let payload = [
+            opcodes::AUDIO_SOURCE,
+            0x00,
+            0x66,
+            0x55,
+            0x44,
+            0x33,
+            0x22,
+            0x11, // reversed MAC
+            AudioSourceType::Media as u8,
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::AudioSource(src) => {
+                assert_eq!(src.mac, "11:22:33:44:55:66");
+                assert_eq!(src.r#type, AudioSourceType::Media);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_source_unknown_type_falls_back_to_none() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [
+            opcodes::AUDIO_SOURCE,
+            0x00,
+            0x66,
+            0x55,
+            0x44,
+            0x33,
+            0x22,
+            0x11,
+            0xFE, // unknown type
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::AudioSource(src) => assert_eq!(src.r#type, AudioSourceType::None),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connected_devices_parses_count_and_macs() {
+        let (m, mut rx) = manager_with_events().await;
+        // opcode pad count [pad pad mac6 info1 info2]*count — base offset for first device is 5 (i=0 → base=5)
+        let payload = [
+            opcodes::CONNECTED_DEVICES,
+            0x00,
+            0x01,
+            0x00,
+            0x00, // padding so device entry starts at index 5
+            0xAA,
+            0xBB,
+            0xCC,
+            0xDD,
+            0xEE,
+            0xFF, // MAC
+            0x42,
+            0x43, // info1, info2
+        ];
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::ConnectedDevices(_old, new) => {
+                assert_eq!(new.len(), 1);
+                assert_eq!(new[0].mac, "AA:BB:CC:DD:EE:FF");
+                assert_eq!(new[0].info1, 0x42);
+                assert_eq!(new[0].info2, 0x43);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connected_devices_truncated_packet_emits_nothing() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [opcodes::CONNECTED_DEVICES, 0x00, 0x02, 0x00, 0x00, 0xAA];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stem_press_parses_known_combos() {
+        let cases = [
+            (
+                0x05,
+                0x01,
+                StemPressType::Single,
+                Some(StemPressBudType::Left),
+            ),
+            (
+                0x06,
+                0x02,
+                StemPressType::Double,
+                Some(StemPressBudType::Right),
+            ),
+            (
+                0x07,
+                0x01,
+                StemPressType::Triple,
+                Some(StemPressBudType::Left),
+            ),
+            (
+                0x08,
+                0x02,
+                StemPressType::Long,
+                Some(StemPressBudType::Right),
+            ),
+        ];
+        for (pt, bud, expected_pt, expected_bud) in cases {
+            let (m, mut rx) = manager_with_events().await;
+            let payload = [opcodes::STEM_PRESS, 0x00, pt, bud];
+            m.receive_packet(&pkt(&payload)).await;
+            match next_event(&mut rx).await.expect("event") {
+                AACPEvent::StemPress(p, b) => {
+                    assert_eq!(p, expected_pt);
+                    assert_eq!(b, expected_bud);
+                }
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stem_press_unknown_type_no_event() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [opcodes::STEM_PRESS, 0x00, 0xAB, 0x01];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn eq_data_parses_8_bands() {
+        let (m, mut rx) = manager_with_events().await;
+        // payload[0]=opcode payload[1..8] padding payload[8..16] EQ bands
+        let mut payload = vec![opcodes::EQ_DATA, 0, 0, 0, 0, 0, 0, 0];
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::EqData(b) => assert_eq!(b, [1, 2, 3, 4, 5, 6, 7, 8]),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_opcode_does_not_panic_or_emit() {
+        let (m, mut rx) = manager_with_events().await;
+        let payload = [0xAB, 0x00, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn smart_routing_ownership_to_false_emits() {
+        let (m, mut rx) = manager_with_events().await;
+        let mut payload = vec![0x11, 0x00];
+        payload.extend_from_slice(b"SetOwnershipToFalse");
+        m.receive_packet(&pkt(&payload)).await;
+        match next_event(&mut rx).await.expect("event") {
+            AACPEvent::OwnershipToFalseRequest => {}
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_routing_other_message_silent() {
+        let (m, mut rx) = manager_with_events().await;
+        let mut payload = vec![0x11, 0x00];
+        payload.extend_from_slice(b"SomeOtherMessage");
+        m.receive_packet(&pkt(&payload)).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscriber_receives_initial_value() {
+        let (m, _rx) = manager_with_events().await;
+        // Push a control command so a value exists
+        let p = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&p)).await;
+
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        m.subscribe_to_control_command(ControlCommandIdentifiers::ListeningMode, sub_tx)
+            .await;
+        let v = timeout(Duration::from_millis(100), sub_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(v, Some(vec![0x02]));
+    }
+
+    #[tokio::test]
+    async fn subscriber_gets_subsequent_updates() {
+        let (m, _rx) = manager_with_events().await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        m.subscribe_to_control_command(ControlCommandIdentifiers::ListeningMode, sub_tx)
+            .await;
+
+        let p = [opcodes::CONTROL_COMMAND, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00];
+        m.receive_packet(&pkt(&p)).await;
+        let v = timeout(Duration::from_millis(100), sub_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(v, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn control_command_identifier_roundtrip() {
+        // Every variant we map in TryFrom should roundtrip.
+        let cases = [
+            (0x01u8, ControlCommandIdentifiers::MicMode),
+            (0x05, ControlCommandIdentifiers::ButtonSendMode),
+            (0x0D, ControlCommandIdentifiers::ListeningMode),
+            (0x1A, ControlCommandIdentifiers::ListeningModeConfigs),
+            (0x34, ControlCommandIdentifiers::AllowOffOption),
+            (0x06, ControlCommandIdentifiers::OwnsConnection),
+        ];
+        for (byte, expected) in cases {
+            assert_eq!(ControlCommandIdentifiers::try_from(byte).unwrap(), expected);
+            assert_eq!(expected as u8, byte);
+        }
+        assert!(ControlCommandIdentifiers::try_from(0xFEu8).is_err());
+    }
 }

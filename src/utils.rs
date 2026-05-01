@@ -1,15 +1,15 @@
+use std::io;
 use std::path::PathBuf;
 
-pub fn runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir)
-    } else {
-        log::warn!(
-            "XDG_RUNTIME_DIR not set, falling back to /tmp for runtime files. \
-             This is less secure as /tmp is world-readable."
-        );
-        PathBuf::from("/tmp")
-    }
+pub fn runtime_dir() -> io::Result<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "XDG_RUNTIME_DIR is not set; refusing to use a world-writable fallback",
+            )
+        })
 }
 
 /// Write battery levels to `airpods-battery.env` in the runtime directory
@@ -20,12 +20,27 @@ pub fn write_battery_env(
     case: Option<u8>,
     headphone: Option<u8>,
 ) {
+    let dir = match runtime_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("Skipping airpods-battery.env: {}", e);
+            return;
+        }
+    };
     let mut content = String::new();
-    if let Some(l) = left { content.push_str(&format!("LEFT={}\n", l)); }
-    if let Some(r) = right { content.push_str(&format!("RIGHT={}\n", r)); }
-    if let Some(c) = case { content.push_str(&format!("CASE={}\n", c)); }
-    if let Some(h) = headphone { content.push_str(&format!("HEADPHONE={}\n", h)); }
-    if let Err(e) = std::fs::write(runtime_dir().join("airpods-battery.env"), content) {
+    if let Some(l) = left {
+        content.push_str(&format!("LEFT={}\n", l));
+    }
+    if let Some(r) = right {
+        content.push_str(&format!("RIGHT={}\n", r));
+    }
+    if let Some(c) = case {
+        content.push_str(&format!("CASE={}\n", c));
+    }
+    if let Some(h) = headphone {
+        content.push_str(&format!("HEADPHONE={}\n", h));
+    }
+    if let Err(e) = std::fs::write(dir.join("airpods-battery.env"), content) {
         log::warn!("Failed to write airpods-battery.env: {}", e);
     }
 }
