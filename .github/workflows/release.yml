@@ -20,7 +20,7 @@ jobs:
           pacman -Syu --needed --noconfirm git rust libpulse
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build release
         run: cargo build --release --locked
@@ -48,7 +48,7 @@ jobs:
           echo "sha256=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload tarball as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: airpods-tui-x86_64
           path: |
