@@ -1,0 +1,64 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --needed --noconfirm git rust libpulse
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Stage tarball contents
+        run: |
+          install -Dm755 target/release/airpods-tui dist/airpods-tui
+          install -Dm644 airpods-tui.service dist/airpods-tui.service
+          install -Dm644 airpods-tui.install dist/airpods-tui.install
+          install -Dm644 LICENSE dist/LICENSE
+          install -Dm644 README.md dist/README.md
+
+      - name: Create tarball
+        id: tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="airpods-tui-${VERSION}-x86_64"
+          mv dist "${NAME}"
+          tar czf "${NAME}.tar.gz" "${NAME}"
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tarball as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airpods-tui-x86_64
+          path: |
+            ${{ steps.tarball.outputs.tarball }}
+            ${{ steps.tarball.outputs.sha256 }}
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.tarball.outputs.tarball }}
+            ${{ steps.tarball.outputs.sha256 }}
