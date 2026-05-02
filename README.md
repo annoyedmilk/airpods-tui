@@ -7,7 +7,7 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 ## Features
 
 - **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications
-- **Noise control**: Off, Transparency, Adaptive, Noise Cancellation (model-aware — Adaptive only shown on capable devices)
+- **Noise control**: Off, Transparency, Adaptive, Noise Cancellation (model-aware, Adaptive only shown on capable devices)
 - **Settings panel**, dynamically built per model:
   - Conversation Awareness (Pro 2, Pro 3, Pro USB-C, 4 ANC, Max 2)
   - NC with One AirPod (any ANC-capable model)
@@ -20,7 +20,7 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
   - Auto Connect
 - **Ear detection** status in the header
 - **Stem press media controls** (play/pause, next/prev) wired through MPRIS
-- **Device renaming** — sets both the AACP name and the BlueZ alias
+- **Device renaming**: sets both the AACP name and the BlueZ alias
 - **Volume swipe synced** to system volume via configurable commands
 - **Auto audio rerouting** to AirPods on connect
 - **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership, resumes when the AirPods return to Linux
@@ -42,7 +42,7 @@ This compiles from source and runs an install hook that:
 - drops the systemd user unit at `/usr/lib/systemd/user/airpods-tui.service`
 - adds `DeviceID = bluetooth:004C:0000:0000` under `[General]` in `/etc/bluetooth/main.conf` (removed on uninstall)
 
-The DeviceID makes BlueZ identify itself as an Apple host. Without it, AirPods still pair and play audio (A2DP works fine), but they refuse to open the AACP control channel — which is what every feature in this tool runs over. So plain music playback works without it, but battery, noise mode, settings, ear detection, etc. all stay blank.
+The DeviceID makes BlueZ identify itself as an Apple host. Without it, AirPods still pair and play audio (A2DP works fine), but they refuse to open the AACP control channel, which is what every feature in this tool runs over. So plain music playback works without it, but battery, noise mode, settings, ear detection, etc. all stay blank.
 
 ### From source
 
@@ -54,11 +54,11 @@ sudo install -Dm755 target/release/airpods-tui /usr/bin/airpods-tui
 sudo install -Dm644 airpods-tui.service /usr/lib/systemd/user/airpods-tui.service
 ```
 
-This path does **not** run the install hook — see [Apple DeviceID setup](#apple-deviceid-setup) below.
+This path does **not** run the install hook, see [Apple DeviceID setup](#apple-deviceid-setup) below.
 
 ### Apple DeviceID setup
 
-Required for AACP. Skip if you installed via the AUR — the package hook already did it.
+Required for AACP. Skip if you installed via the AUR, the package hook already did it.
 
 ```bash
 sudo sed -i '/^\[General\]/a DeviceID = bluetooth:004C:0000:0000' /etc/bluetooth/main.conf
@@ -150,8 +150,8 @@ Set any command to `[]` to disable that integration. `restart_audio_server` defa
 
 Runtime:
 
-- **BlueZ** — D-Bus interface to Bluetooth
-- **libpulse** — PulseAudio client lib (also used to control PipeWire's pulse compatibility layer)
+- **BlueZ**: D-Bus interface to Bluetooth
+- **libpulse**: PulseAudio client lib (also used to control PipeWire's pulse compatibility layer)
 - **dbus**
 
 Optional:
