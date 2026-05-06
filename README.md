@@ -33,10 +33,12 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 ### Arch / Omarchy (AUR)
 
 ```bash
-yay -S airpods-tui-git
+yay -S airpods-tui-bin    # prebuilt x86_64 binary, fastest
+# or
+yay -S airpods-tui-git    # builds from latest main
 ```
 
-This compiles from source and runs an install hook that:
+Both packages run an install hook that:
 
 - installs the binary to `/usr/bin/airpods-tui`
 - drops the systemd user unit at `/usr/lib/systemd/user/airpods-tui.service`
