@@ -32,7 +32,6 @@ pub mod opcodes {
     pub const PROXIMITY_KEYS_REQ: u8 = 0x30;
     pub const PROXIMITY_KEYS_RSP: u8 = 0x31;
     pub const STEM_PRESS: u8 = 0x19;
-    pub const EQ_DATA: u8 = 0x53;
     pub const CONNECTED_DEVICES: u8 = 0x2E;
     pub const AUDIO_SOURCE: u8 = 0x0E;
 }
@@ -81,6 +80,7 @@ pub enum ControlCommandIdentifiers {
     EarDetectionConfig = 0x0A,
     AutomaticConnectionConfig = 0x20,
     OwnsConnection = 0x06,
+    InCaseToneVolume = 0x40,
 }
 
 impl TryFrom<u8> for ControlCommandIdentifiers {
@@ -122,6 +122,7 @@ impl TryFrom<u8> for ControlCommandIdentifiers {
             0x0A => Ok(Self::EarDetectionConfig),
             0x20 => Ok(Self::AutomaticConnectionConfig),
             0x06 => Ok(Self::OwnsConnection),
+            0x40 => Ok(Self::InCaseToneVolume),
             _ => Err(()),
         }
     }
@@ -165,6 +166,7 @@ impl std::fmt::Display for ControlCommandIdentifiers {
             ControlCommandIdentifiers::EarDetectionConfig => "Ear Detection Config",
             ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
             ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
+            ControlCommandIdentifiers::InCaseToneVolume => "In Case Tone Volume",
         };
         write!(f, "{}", name)
     }
@@ -287,7 +289,6 @@ pub enum AACPEvent {
     OwnershipToFalseRequest,
     DeviceInfo(Box<crate::devices::airpods::AirPodsInformation>),
     StemPress(StemPressType, Option<StemPressBudType>),
-    EqData([u8; 8]),
     /// L2CAP connection dropped (read error or remote close).
     ConnectionLost,
 }
@@ -440,6 +441,15 @@ impl AACPManager {
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
+    }
+
+    /// Tear down the L2CAP session deliberately: abort the recv/send tasks
+    /// (dropping their socket handles closes it) and clear the sender.
+    /// Does not emit `ConnectionLost` — callers tearing down a half-dead
+    /// init drive their own retry.
+    pub async fn disconnect(&self) {
+        self.tasks.lock().await.abort_all();
+        self.state.lock().await.sender = None;
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
@@ -747,19 +757,7 @@ impl AACPManager {
                     device_data.name = info.name.clone();
                     device_data.information = Some(DeviceInformation::AirPods(info.clone()));
                 }
-                let Ok(json) = serde_json::to_string(&state.devices) else {
-                    error!("Failed to serialize devices to JSON");
-                    return;
-                };
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                save_devices(&state.devices).await;
                 info!("Received Information: {:?}", info);
                 if let Some(tx) = &state.event_tx {
                     let _ = tx.send(AACPEvent::DeviceInfo(Box::new(info)));
@@ -817,6 +815,7 @@ impl AACPManager {
                                 name: mac_str.clone(),
                                 type_: DeviceType::AirPods,
                                 information: None,
+                                volume_swipe: None,
                             });
                         match kt {
                             ProximityKeyType::Irk => {
@@ -836,19 +835,7 @@ impl AACPManager {
                         }
                     }
                 }
-                let Ok(json) = serde_json::to_string(&state.devices) else {
-                    error!("Failed to serialize devices to JSON");
-                    return;
-                };
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                save_devices(&state.devices).await;
             }
             opcodes::STEM_PRESS => {
                 let press_type = payload.get(2).and_then(|&b| match b {
@@ -948,24 +935,20 @@ impl AACPManager {
                     debug!("Smart-routing response (ignored): {}", packet_string);
                 }
             }
-            opcodes::EQ_DATA => {
-                // Packet: opcode(1) pad(1) 0x84 0x00 0x02 0x02 Phone Media EQ[0..8]
-                // payload[0] = opcode, so EQ bands start at payload[8]
-                if payload.len() >= 16 {
-                    let mut bands = [0u8; 8];
-                    bands.copy_from_slice(&payload[8..16]);
-                    let state = self.state.lock().await;
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::EqData(bands));
-                    }
-                }
-                debug!("Received EQ Data");
-            }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
 
-        // Notify anyone waiting for a device response (replaces fixed sleep delays)
+        // Notify anyone waiting for a device response
         self.state.lock().await.packet_received.notify_waiters();
+    }
+
+    /// Inject a synthetic event into this manager's event stream. It is
+    /// ordered after everything the device has already sent, so it survives
+    /// the snapshot reset that DeviceConnected triggers at the end of init.
+    pub async fn emit_event(&self, event: AACPEvent) {
+        if let Some(ref tx) = self.state.lock().await.event_tx {
+            let _ = tx.send(event);
+        }
     }
 
     pub async fn send_notification_request(&self) -> Result<()> {
@@ -1028,6 +1011,23 @@ impl AACPManager {
         identifier: ControlCommandIdentifiers,
         value: &[u8],
     ) -> Result<()> {
+        // Volume Swipe is remembered per device and re-applied on connect
+        // (toggles use 0x01 = on, 0x02 = off on the wire).
+        if identifier == ControlCommandIdentifiers::VolumeSwipeMode {
+            let mut state = self.state.lock().await;
+            if let Some(mac) = state.airpods_mac {
+                let mac_str = mac.to_string();
+                let device_data = state.devices.entry(mac_str.clone()).or_insert(DeviceData {
+                    name: mac_str,
+                    type_: DeviceType::AirPods,
+                    information: None,
+                    volume_swipe: None,
+                });
+                device_data.volume_swipe = Some(value.first() == Some(&0x01));
+                save_devices(&state.devices).await;
+            }
+        }
+
         let opcode = [opcodes::CONTROL_COMMAND, 0x00];
         let mut data = vec![identifier as u8];
         for i in 0..4 {
@@ -1041,6 +1041,24 @@ impl AACPManager {
     pub async fn send_ssl_request(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
+    }
+
+}
+
+/// Persist the device store (names, LE keys, remembered settings) to devices.json.
+async fn save_devices(devices: &HashMap<String, DeviceData>) {
+    let Ok(json) = serde_json::to_string(devices) else {
+        error!("Failed to serialize devices to JSON");
+        return;
+    };
+    if let Some(parent) = get_devices_path().parent()
+        && let Err(e) = tokio::fs::create_dir_all(&parent).await
+    {
+        error!("Failed to create directory for devices: {}", e);
+        return;
+    }
+    if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
+        error!("Failed to save devices: {}", e);
     }
 }
 
@@ -1571,19 +1589,6 @@ mod tests {
         let payload = [opcodes::STEM_PRESS, 0x00, 0xAB, 0x01];
         m.receive_packet(&pkt(&payload)).await;
         assert!(next_event(&mut rx).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn eq_data_parses_8_bands() {
-        let (m, mut rx) = manager_with_events().await;
-        // payload[0]=opcode payload[1..8] padding payload[8..16] EQ bands
-        let mut payload = vec![opcodes::EQ_DATA, 0, 0, 0, 0, 0, 0, 0];
-        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        m.receive_packet(&pkt(&payload)).await;
-        match next_event(&mut rx).await.expect("event") {
-            AACPEvent::EqData(b) => assert_eq!(b, [1, 2, 3, 4, 5, 6, 7, 8]),
-            _ => panic!(),
-        }
     }
 
     #[tokio::test]

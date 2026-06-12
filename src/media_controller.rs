@@ -84,6 +84,11 @@ enum AudioCommand {
         suspend: bool,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    SetSinkMute {
+        sink_name: String,
+        mute: bool,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     HasActiveSinkInput {
         sink_name: String,
         reply: tokio::sync::oneshot::Sender<bool>,
@@ -202,6 +207,15 @@ fn spawn_audio_thread(
                 } => {
                     let result =
                         pa_suspend_sink_by_name(&mut mainloop, &mut context, &sink_name, suspend);
+                    let _ = reply.send(result);
+                }
+                AudioCommand::SetSinkMute {
+                    sink_name,
+                    mute,
+                    reply,
+                } => {
+                    let result =
+                        pa_set_sink_mute_by_name(&mut mainloop, &mut context, &sink_name, mute);
                     let _ = reply.send(result);
                 }
                 AudioCommand::HasActiveSinkInput { sink_name, reply } => {
@@ -335,6 +349,29 @@ fn pa_suspend_sink_by_name(
     let op = context.introspect().suspend_sink_by_name(
         sink_name,
         suspend,
+        Some(Box::new({
+            let success = success.clone();
+            move |result: bool| {
+                *success.borrow_mut() = result;
+            }
+        })),
+    );
+    while op.get_state() == OperationState::Running {
+        mainloop.iterate(false);
+    }
+    *success.borrow()
+}
+
+fn pa_set_sink_mute_by_name(
+    mainloop: &mut Mainloop,
+    context: &mut Context,
+    sink_name: &str,
+    mute: bool,
+) -> bool {
+    let success = Rc::new(RefCell::new(false));
+    let op = context.introspect().set_sink_mute_by_name(
+        sink_name,
+        mute,
         Some(Box::new({
             let success = success.clone();
             move |result: bool| {
@@ -641,6 +678,20 @@ async fn audio_cmd_move_all_sink_inputs(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(AudioCommand::MoveAllSinkInputs {
         sink_name: sink_name.to_string(),
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or(false)
+}
+
+async fn audio_cmd_set_sink_mute(
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+    sink_name: &str,
+    mute: bool,
+) -> bool {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(AudioCommand::SetSinkMute {
+        sink_name: sink_name.to_string(),
+        mute,
         reply: reply_tx,
     });
     reply_rx.await.unwrap_or(false)
@@ -1040,13 +1091,26 @@ impl MediaController {
         let mut current_device_index = device_index;
 
         if current_device_index.is_none() {
-            warn!("Device index not found, trying to get it.");
-            current_device_index = audio_cmd_get_device_index(&audio_tx, &mac).await;
+            debug!("Device index not found, polling for it.");
+            // The PulseAudio card registers a few seconds after the BT
+            // connect that triggered us; poll instead of giving up.
+            for attempt in 0..8 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(750)).await;
+                }
+                current_device_index = audio_cmd_get_device_index(&audio_tx, &mac).await;
+                if current_device_index.is_some() {
+                    break;
+                }
+            }
             if let Some(idx) = current_device_index {
                 let mut state = self.state.lock().await;
                 state.device_index = Some(idx);
             } else {
-                warn!("Could not get device index. Cannot activate A2DP profile.");
+                warn!(
+                    "No PulseAudio card appeared for {}. Cannot activate A2DP profile.",
+                    mac
+                );
                 return;
             }
         }
@@ -1099,9 +1163,25 @@ impl MediaController {
             let ok = audio_cmd_set_card_profile(&audio_tx, idx, &preferred_profile).await;
             if ok {
                 info!("Successfully activated A2DP profile: {}", preferred_profile);
-                if let Some(sink_name) = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await {
+                // The sink appears shortly after the profile switch; poll
+                // briefly so rerouting doesn't miss it.
+                let mut sink_name = None;
+                for attempt in 0..5 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(750)).await;
+                    }
+                    sink_name = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac).await;
+                    if sink_name.is_some() {
+                        break;
+                    }
+                }
+                if let Some(sink_name) = sink_name {
                     audio_cmd_set_default_sink(&audio_tx, &sink_name).await;
                     audio_cmd_move_all_sink_inputs(&audio_tx, &sink_name).await;
+                    // PipeWire persists a sink's mute flag across sessions; a
+                    // sink muted weeks ago comes back muted and the AirPods
+                    // look broken. Routing audio here means we want it heard.
+                    audio_cmd_set_sink_mute(&audio_tx, &sink_name, false).await;
                     info!("Rerouted audio output to {}", sink_name);
                 } else {
                     warn!("Could not find sink for MAC {} to reroute audio", mac);
@@ -1653,14 +1733,11 @@ impl MediaController {
                 }
             }
             4 | 6 | 7 | 8 | 9 => {
-                #[allow(unused_assignments)]
-                let mut maybe_original = None;
-                {
+                let maybe_original = {
                     let mut state = self.state.lock().await;
                     if state.conv_conversation_started {
-                        maybe_original = state.conv_original_volume;
-                        state.conv_original_volume = None;
                         state.conv_conversation_started = false;
+                        state.conv_original_volume.take()
                     } else {
                         debug!(
                             "Received status {} but conversation was not started; ignoring restore",
@@ -1668,7 +1745,7 @@ impl MediaController {
                         );
                         return;
                     }
-                }
+                };
                 if let Some(orig) = maybe_original {
                     audio_cmd_transition_volume(&audio_tx, &sink, orig).await;
                     info!(

@@ -393,6 +393,46 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
         (None, app_rx, cmd_tx)
     };
 
+    fn render_waybar_json(app: &App) -> String {
+        match app.selected_device() {
+            Some(DeviceState::AirPods(s)) => {
+                let model_name = s.model.as_deref().unwrap_or(&s.name);
+                let min_bat = [s.battery_left, s.battery_right, s.battery_headphone]
+                    .iter()
+                    .filter_map(|b| b.as_ref().map(|(l, _)| *l))
+                    .min();
+                let percentage = min_bat.unwrap_or(0);
+                let mut tooltip_parts = vec![model_name.to_string()];
+                if let Some((l, _)) = s.battery_left {
+                    tooltip_parts.push(format!("L: {}%", l));
+                }
+                if let Some((r, _)) = s.battery_right {
+                    tooltip_parts.push(format!("R: {}%", r));
+                }
+                if let Some((c, _)) = s.battery_case {
+                    tooltip_parts.push(format!("C: {}%", c));
+                }
+                if let Some((h, _)) = s.battery_headphone {
+                    tooltip_parts.push(format!("{}%", h));
+                }
+                serde_json::json!({
+                    "text": format!("{}%", percentage),
+                    "tooltip": tooltip_parts.join("\n"),
+                    "class": "connected",
+                    "percentage": percentage,
+                })
+                .to_string()
+            }
+            _ => serde_json::json!({
+                "text": "",
+                "tooltip": "No AirPods",
+                "class": "disconnected",
+                "percentage": 0,
+            })
+            .to_string(),
+        }
+    }
+
     let mut app = App::new(app_rx, cmd_tx);
     let deadline = if watch {
         None
@@ -430,47 +470,22 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         }
 
-        let json = match app.selected_device() {
-            Some(DeviceState::AirPods(s)) => {
-                let model_name = s.model.as_deref().unwrap_or(&s.name);
-                let min_bat = [s.battery_left, s.battery_right, s.battery_headphone]
-                    .iter()
-                    .filter_map(|b| b.as_ref().map(|(l, _)| *l))
-                    .min();
-                let percentage = min_bat.unwrap_or(0);
-                let text = format!("{}%", percentage);
-                let mut tooltip_parts = vec![model_name.to_string()];
-                if let Some((l, _)) = s.battery_left {
-                    tooltip_parts.push(format!("L: {}%", l));
-                }
-                if let Some((r, _)) = s.battery_right {
-                    tooltip_parts.push(format!("R: {}%", r));
-                }
-                if let Some((c, _)) = s.battery_case {
-                    tooltip_parts.push(format!("C: {}%", c));
-                }
-                if let Some((h, _)) = s.battery_headphone {
-                    tooltip_parts.push(format!("{}%", h));
-                }
-                let tooltip = tooltip_parts.join("\\n");
-                format!(
-                    r#"{{"text":"{}","tooltip":"{}","class":"connected","percentage":{}}}"#,
-                    text, tooltip, percentage
-                )
+        if watch {
+            let json = render_waybar_json(&app);
+            if json != last_json {
+                println!("{}", json);
+                last_json = json;
             }
-            None => r#"{"text":"","tooltip":"No AirPods","class":"disconnected","percentage":0}"#
-                .to_string(),
-        };
-
-        if json != last_json {
-            println!("{}", json);
-            last_json = json;
-            if !watch
-                && matches!(app.selected_device(), Some(DeviceState::AirPods(s)) if s.battery_left.is_some() || s.battery_right.is_some())
-            {
-                break;
-            }
+        } else if matches!(app.selected_device(), Some(DeviceState::AirPods(s)) if s.battery_left.is_some() || s.battery_right.is_some())
+        {
+            break; // battery data settled, answer now
         }
+    }
+
+    if !watch {
+        // Single-shot: exactly one line, printed after the state settled
+        // (battery arrived) or the deadline passed.
+        println!("{}", render_waybar_json(&app));
     }
 
     Ok(())
@@ -589,7 +604,7 @@ async fn bluez_connection_listener(
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     devices_list: HashMap<String, DeviceData>,
     config: config::Config,
-    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, u16)>,
 ) {
     let rule =
         "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
@@ -703,66 +718,95 @@ struct AirPodsInitContext {
     app_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     config: config::Config,
-    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, u16)>,
+}
+
+enum InitOutcome {
+    /// AACP session established and DeviceConnected sent.
+    Ready,
+    /// Another task already owns (or is initializing) this device.
+    AlreadyClaimed,
+    /// Init failed; the slot was released and DeviceDisconnected sent.
+    Failed,
+}
+
+async fn try_airpods_init(
+    addr: Address,
+    name: String,
+    product_id: u16,
+    ctx: &AirPodsInitContext,
+) -> InitOutcome {
+    let addr_str = addr.to_string();
+
+    // Atomically claim the slot under a single write lock. If an entry
+    // already exists (either fully ready or another init in progress),
+    // bail before the long async init can race with us. The reconnect
+    // handler removes stale entries before re-initializing, so a leftover
+    // placeholder cannot strand future inits.
+    {
+        let mut managers = ctx.device_managers.write().await;
+        if managers.contains_key(&addr_str) {
+            info!(
+                "Skipping init for {} — already connected or initializing",
+                addr_str
+            );
+            return InitOutcome::AlreadyClaimed;
+        }
+        managers.insert(addr_str.clone(), DeviceManagers::placeholder());
+    }
+
+    match AirPodsDevice::new(
+        addr,
+        ctx.app_tx.clone(),
+        product_id,
+        ctx.config.clone(),
+        Some(ctx.reconnect_tx.clone()),
+    )
+    .await
+    {
+        Ok(airpods_device) => {
+            let mut managers = ctx.device_managers.write().await;
+            managers
+                .entry(addr_str.clone())
+                .and_modify(|dm| dm.set_aacp(airpods_device.aacp_manager.clone()))
+                .or_insert_with(|| DeviceManagers::with_aacp(airpods_device.aacp_manager));
+            drop(managers);
+            // Notify the TUI only once AACP is alive. The handle_aacp_event
+            // path auto-creates a placeholder device entry if any AACP event
+            // arrived during init, so this ordering is safe.
+            if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
+                mac: addr_str.clone(),
+                name,
+                product_id,
+            }) {
+                log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
+            }
+            InitOutcome::Ready
+        }
+        Err(e) => {
+            log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
+            ctx.device_managers.write().await.remove(&addr_str);
+            // No DeviceConnected was sent; nothing to roll back. If an AACP
+            // event auto-created a placeholder, sweep it now.
+            let _ = ctx
+                .app_tx
+                .send(AppEvent::DeviceDisconnected(addr_str.clone()));
+            InitOutcome::Failed
+        }
+    }
 }
 
 fn spawn_airpods_init(addr: Address, name: String, product_id: u16, ctx: AirPodsInitContext) {
-    let addr_str = addr.to_string();
-
     tokio::spawn(async move {
-        // Atomically claim the slot under a single write lock. If an entry
-        // already exists (either fully ready or another init in progress),
-        // bail before the long async init can race with us. The reconnect
-        // handler removes stale entries before re-spawning, so a leftover
-        // placeholder cannot strand future inits.
-        {
-            let mut managers = ctx.device_managers.write().await;
-            if managers.contains_key(&addr_str) {
-                info!(
-                    "Skipping init for {} — already connected or initializing",
-                    addr_str
-                );
-                return;
-            }
-            managers.insert(addr_str.clone(), DeviceManagers::placeholder());
-        }
-
-        match AirPodsDevice::new(
-            addr,
-            ctx.app_tx.clone(),
-            product_id,
-            ctx.config,
-            Some(ctx.reconnect_tx),
-        )
-        .await
-        {
-            Ok(airpods_device) => {
-                let mut managers = ctx.device_managers.write().await;
-                managers
-                    .entry(addr_str.clone())
-                    .and_modify(|dm| dm.set_aacp(airpods_device.aacp_manager.clone()))
-                    .or_insert_with(|| DeviceManagers::with_aacp(airpods_device.aacp_manager));
-                drop(managers);
-                // Notify the TUI only once AACP is alive. The handle_aacp_event
-                // path auto-creates a placeholder device entry if any AACP event
-                // arrived during init, so this ordering is safe.
-                if let Err(e) = ctx.app_tx.send(AppEvent::DeviceConnected {
-                    mac: addr_str.clone(),
-                    name,
-                    product_id,
-                }) {
-                    log::warn!("Failed to send DeviceConnected for {}: {}", addr_str, e);
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to initialize AirPods device {}: {}", addr_str, e);
-                ctx.device_managers.write().await.remove(&addr_str);
-                // No DeviceConnected was sent; nothing to roll back. If an AACP
-                // event auto-created a placeholder, sweep it now.
-                let _ = ctx
-                    .app_tx
-                    .send(AppEvent::DeviceDisconnected(addr_str.clone()));
-            }
+        if matches!(
+            try_airpods_init(addr, name, product_id, &ctx).await,
+            InitOutcome::Failed
+        ) {
+            // Fresh connects often race BlueZ profile setup and die with
+            // ENOTCONN/ECONNABORTED on the first L2CAP attempt. Hand the
+            // device to the reconnect loop, which keeps retrying with
+            // backoff while BlueZ still reports it connected.
+            let _ = ctx.reconnect_tx.send((addr, product_id));
         }
     });
 }
@@ -782,7 +826,7 @@ async fn bluetooth_main(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    // AVRCP volume monitor (async task, replaces dedicated thread)
+    // AVRCP volume monitor
     let vol_config = config.clone();
     tokio::spawn(async move {
         avrcp_volume_monitor(vol_config).await;
@@ -825,42 +869,75 @@ async fn bluetooth_main(
         }
     });
 
-    // Reconnect channel: when L2CAP drops but BlueZ still reports Connected,
-    // airpods.rs sends (addr, name, product_id) here to trigger re-initialization.
-    let (reconnect_tx, mut reconnect_rx) = unbounded_channel::<(Address, String, u16)>();
+    // Reconnect channel: fed by ConnectionLost (L2CAP died) and by failed
+    // inits. Retries with backoff for as long as BlueZ still reports the
+    // device connected; once the BT link itself is gone, the connection
+    // listener owns recovery via the next Connected=true event.
+    let (reconnect_tx, mut reconnect_rx) = unbounded_channel::<(Address, u16)>();
     {
         let app_tx = app_tx.clone();
         let dm = device_managers.clone();
         let cfg = config.clone();
         let reconnect_tx = reconnect_tx.clone();
         let dl = devices_list.clone();
+        let adapter = adapter.clone();
         tokio::spawn(async move {
-            while let Some((addr, _name, product_id)) = reconnect_rx.recv().await {
+            while let Some((addr, product_id)) = reconnect_rx.recv().await {
                 let addr_str = addr.to_string();
-                // Re-read the name from BlueZ (may have been renamed)
+                // Drop the dead session, but never touch a healthy or
+                // still-initializing one (queued retries can be stale).
+                {
+                    let mut managers = dm.write().await;
+                    if let Some(existing) = managers.get(&addr_str) {
+                        let Some(aacp) = existing.get_aacp() else {
+                            continue; // init in progress elsewhere
+                        };
+                        if aacp.state.lock().await.sender.is_some() {
+                            continue; // healthy session, stale retry
+                        }
+                        managers.remove(&addr_str);
+                    }
+                }
+                // Re-read the name from our store (may have been renamed)
                 let name = dl
                     .get(&addr_str)
                     .filter(|d| !d.name.is_empty())
                     .map(|d| d.name.clone())
                     .unwrap_or_else(|| "AirPods".to_string());
-                info!(
-                    "AACP reconnect: {} ({}), waiting 2s before retry",
-                    name, addr
-                );
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                // Remove stale manager before reinit
-                dm.write().await.remove(&addr_str);
-                spawn_airpods_init(
-                    addr,
-                    name,
-                    product_id,
-                    AirPodsInitContext {
-                        app_tx: app_tx.clone(),
-                        device_managers: dm.clone(),
-                        config: cfg.clone(),
-                        reconnect_tx: reconnect_tx.clone(),
-                    },
-                );
+                let ctx = AirPodsInitContext {
+                    app_tx: app_tx.clone(),
+                    device_managers: dm.clone(),
+                    config: cfg.clone(),
+                    reconnect_tx: reconnect_tx.clone(),
+                };
+                let mut attempt: u32 = 0;
+                loop {
+                    attempt += 1;
+                    let delay = Duration::from_secs((1u64 << attempt.min(5)).min(30));
+                    info!(
+                        "AACP reconnect: {} ({}) attempt {} in {:?}",
+                        name, addr, attempt, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    if dm.read().await.contains_key(&addr_str) {
+                        break; // another path claimed the device
+                    }
+                    let bluez_connected = match adapter.device(addr) {
+                        Ok(device) => device.is_connected().await.unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if !bluez_connected {
+                        info!(
+                            "{} is gone at the BlueZ level; the connection listener resumes when it returns",
+                            addr_str
+                        );
+                        break;
+                    }
+                    match try_airpods_init(addr, name.clone(), product_id, &ctx).await {
+                        InitOutcome::Ready | InitOutcome::AlreadyClaimed => break,
+                        InitOutcome::Failed => continue,
+                    }
+                }
             }
         });
     }

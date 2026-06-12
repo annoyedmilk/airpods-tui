@@ -78,10 +78,22 @@ pub struct AirPodsDeviceState {
     pub hardware_revision: Option<String>,
     pub left_serial: Option<String>,
     pub right_serial: Option<String>,
+    // Auto ear detection (play/pause on remove) — None until reported
+    pub ear_detection_enabled: Option<bool>,
+    /// Long-press cycle bitmask (0x1A): Off=1, NC=2, Transparency=4, Adaptive=8.
+    pub listening_mode_configs: Option<u8>,
+    /// Press-and-hold action per bud (0x16): 0x01 = Noise Control, 0x05 = Siri.
+    pub hold_left: Option<u8>,
+    pub hold_right: Option<u8>,
+    pub sleep_detection: Option<bool>,
+    /// "Hey Siri" voice activation (0x12).
+    pub siri_voice_trigger: Option<bool>,
+    pub in_case_tone: Option<bool>,
+    pub in_case_tone_volume: Option<u8>,
+    /// AirPods Max digital crown direction (0x1C): true = reversed.
+    pub crown_reversed: Option<bool>,
     // Peer devices
     pub peer_devices: Vec<ConnectedDevice>,
-    // Headphone Accommodation EQ (read-only, from device)
-    pub eq_bands: Option<[u8; 8]>,
 }
 
 impl AirPodsDeviceState {
@@ -116,8 +128,16 @@ impl AirPodsDeviceState {
             hardware_revision: None,
             left_serial: None,
             right_serial: None,
+            ear_detection_enabled: None,
+            listening_mode_configs: None,
+            hold_left: None,
+            hold_right: None,
+            sleep_detection: None,
+            siri_voice_trigger: None,
+            in_case_tone: None,
+            in_case_tone_volume: None,
+            crown_reversed: None,
             peer_devices: Vec::new(),
-            eq_bands: None,
         }
     }
 }
@@ -177,6 +197,17 @@ impl App {
         self.selected_mac().and_then(|mac| self.devices.get(mac))
     }
 
+    /// Section the keyboard actually operates on. Devices without noise
+    /// control have no Noise Control rows, so focus falls through to
+    /// Settings regardless of what Tab-cycling state says.
+    pub fn effective_section(&self) -> FocusedSection {
+        if self.noise_control_rows() == 0 {
+            FocusedSection::Settings
+        } else {
+            self.focused_section
+        }
+    }
+
     /// Number of rows in the Noise Control section.
     /// Must match the length of `ui::noise_mode_list`.
     pub fn noise_control_rows(&self) -> usize {
@@ -188,8 +219,10 @@ impl App {
         }
     }
 
-    /// Build the list of settings items for the current AirPods device.
-    /// Returns Vec<(label, SettingsItemKind)>.
+    /// Build the settings rows for the current AirPods device as one flat,
+    /// logically ordered list. Rows are model-gated; optional features only
+    /// appear once the device has reported their state (so we never write
+    /// blind).
     pub fn settings_items(&self) -> Vec<SettingsItem> {
         let Some(DeviceState::AirPods(s)) = self.selected_device() else {
             return Vec::new();
@@ -197,30 +230,43 @@ impl App {
         let info = crate::devices::apple_models::model_info(s.product_id);
         let mut items = Vec::new();
 
-        if s.has_anc && info.has_conversation_awareness {
-            items.push(SettingsItem::Toggle {
-                label: "Conversation Awareness",
-                value: s.conversation_awareness,
-                cmd: ControlCommandIdentifiers::ConversationDetectConfig,
-            });
-        }
+        // Noise control behavior
         if s.has_anc {
+            if info.has_conversation_awareness {
+                items.push(SettingsItem::Toggle {
+                    label: "Conversation Awareness",
+                    value: s.conversation_awareness,
+                    cmd: ControlCommandIdentifiers::ConversationDetectConfig,
+                });
+            }
+            if s.has_adaptive && s.listening_mode == AirPodsNoiseControlMode::Adaptive {
+                items.push(SettingsItem::Slider {
+                    label: "Adaptive Noise Level",
+                    value: s.adaptive_noise_level.unwrap_or(50),
+                    min: 0,
+                    max: 100,
+                    cmd: ControlCommandIdentifiers::AutoAncStrength,
+                });
+            }
             items.push(SettingsItem::Toggle {
                 label: "NC with One AirPod",
                 value: s.one_bud_anc,
                 cmd: ControlCommandIdentifiers::OneBudAncMode,
             });
         }
-        items.push(SettingsItem::Toggle {
-            label: "Personalized Volume",
-            value: s.adaptive_volume,
-            cmd: ControlCommandIdentifiers::AdaptiveVolumeConfig,
-        });
+
+        // Stem controls
         if info.has_stem_controls {
             items.push(SettingsItem::Toggle {
                 label: "Volume Swipe",
                 value: s.volume_swipe,
                 cmd: ControlCommandIdentifiers::VolumeSwipeMode,
+            });
+            items.push(SettingsItem::Enum {
+                label: "Volume Swipe Length",
+                value: s.volume_swipe_length.unwrap_or(0),
+                options: &["Default", "Longer", "Longest"],
+                cmd: ControlCommandIdentifiers::VolumeSwipeInterval,
             });
             items.push(SettingsItem::Enum {
                 label: "Press Speed",
@@ -234,7 +280,70 @@ impl App {
                 options: &["Default", "Shorter", "Shortest"],
                 cmd: ControlCommandIdentifiers::ClickHoldInterval,
             });
+            // Per-bud hold action; shown once the device reports it.
+            if let Some(v) = s.hold_left {
+                items.push(SettingsItem::HoldMode {
+                    label: "Hold Left",
+                    right: false,
+                    value: hold_wire_to_idx(v),
+                });
+            }
+            if let Some(v) = s.hold_right {
+                items.push(SettingsItem::HoldMode {
+                    label: "Hold Right",
+                    right: true,
+                    value: hold_wire_to_idx(v),
+                });
+            }
         }
+        // Which modes the press-and-hold gesture cycles through (only once
+        // the device reported the bitmask).
+        if s.has_anc
+            && let Some(mask) = s.listening_mode_configs
+        {
+            items.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Off",
+                bit: 0x01,
+                value: mask & 0x01 != 0,
+            });
+            items.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Noise Cancellation",
+                bit: 0x02,
+                value: mask & 0x02 != 0,
+            });
+            items.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Transparency",
+                bit: 0x04,
+                value: mask & 0x04 != 0,
+            });
+            if s.has_adaptive {
+                items.push(SettingsItem::CycleBit {
+                    label: "Hold Cycle: Adaptive",
+                    bit: 0x08,
+                    value: mask & 0x08 != 0,
+                });
+            }
+        }
+        // AirPods Max digital crown.
+        if !info.has_stem_controls && s.battery_headphone.is_some() {
+            items.push(SettingsItem::Enum {
+                label: "Crown Direction",
+                value: if s.crown_reversed.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+                options: &["Default", "Reversed"],
+                cmd: ControlCommandIdentifiers::CrownRotationDirection,
+            });
+        }
+
+        // Sound
+        items.push(SettingsItem::Toggle {
+            label: "Personalized Volume",
+            value: s.adaptive_volume,
+            cmd: ControlCommandIdentifiers::AdaptiveVolumeConfig,
+        });
         items.push(SettingsItem::Slider {
             label: "Tone Volume",
             value: s.tone_volume.unwrap_or(50),
@@ -242,29 +351,51 @@ impl App {
             max: 100,
             cmd: ControlCommandIdentifiers::ChimeVolume,
         });
-        if info.has_stem_controls {
-            items.push(SettingsItem::Enum {
-                label: "Volume Swipe Length",
-                value: s.volume_swipe_length.unwrap_or(0),
-                options: &["Default", "Longer", "Longest"],
-                cmd: ControlCommandIdentifiers::VolumeSwipeInterval,
+        if let Some(v) = s.in_case_tone {
+            items.push(SettingsItem::Toggle {
+                label: "In-Case Tone",
+                value: v,
+                cmd: ControlCommandIdentifiers::InCaseToneConfig,
             });
         }
-        if s.has_adaptive && s.listening_mode == AirPodsNoiseControlMode::Adaptive {
+        if let Some(v) = s.in_case_tone_volume {
             items.push(SettingsItem::Slider {
-                label: "Adaptive Noise Level",
-                value: s.adaptive_noise_level.unwrap_or(50),
+                label: "In-Case Tone Volume",
+                value: v,
                 min: 0,
                 max: 100,
-                cmd: ControlCommandIdentifiers::AutoAncStrength,
+                cmd: ControlCommandIdentifiers::InCaseToneVolume,
             });
         }
+
+        // Behavior
         items.push(SettingsItem::Enum {
             label: "Mic Mode",
-            value: s.mic_mode.unwrap_or(2),
-            options: &["Always Left", "Always Right", "Automatic"],
+            // Wire values: 0x00 = Automatic, 0x01 = Right, 0x02 = Left —
+            // option order matches so index == wire value.
+            value: s.mic_mode.unwrap_or(0),
+            options: &["Automatic", "Always Right", "Always Left"],
             cmd: ControlCommandIdentifiers::MicMode,
         });
+        if let Some(v) = s.siri_voice_trigger {
+            items.push(SettingsItem::Toggle {
+                label: "Siri Voice Trigger",
+                value: v,
+                cmd: ControlCommandIdentifiers::VoiceTrigger,
+            });
+        }
+        items.push(SettingsItem::Toggle {
+            label: "Auto Ear Detection",
+            value: s.ear_detection_enabled.unwrap_or(true),
+            cmd: ControlCommandIdentifiers::EarDetectionConfig,
+        });
+        if let Some(v) = s.sleep_detection {
+            items.push(SettingsItem::Toggle {
+                label: "Sleep Detection",
+                value: v,
+                cmd: ControlCommandIdentifiers::SleepDetectionConfig,
+            });
+        }
         items.push(SettingsItem::Toggle {
             label: "Auto Connect",
             value: s.auto_connect.unwrap_or(true),
@@ -284,8 +415,8 @@ impl App {
                 if self.devices.contains_key(&mac) {
                     if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(&mac) {
                         s.name = name;
-                        // Fix race: AACP events may arrive before DeviceConnected,
-                        // so update product_id and model info now
+                        // AACP events may arrive before DeviceConnected and
+                        // auto-create the entry without model info; fill it in.
                         if product_id != 0 && s.product_id == 0 {
                             let info = crate::devices::apple_models::model_info(product_id);
                             s.product_id = product_id;
@@ -417,79 +548,85 @@ impl App {
                 AACPEvent::ConnectedDevices(_, new_devices) => {
                     state.peer_devices = new_devices;
                 }
-                AACPEvent::EqData(bands) => {
-                    state.eq_bands = Some(bands);
+                AACPEvent::ControlCommand(cmd) => {
+                    // ClickHoldMode is the one two-byte command:
+                    // value[0] = right bud, value[1] = left bud.
+                    if cmd.identifier == ControlCommandIdentifiers::ClickHoldMode {
+                        state.hold_right = cmd.value.first().copied();
+                        state.hold_left = cmd.value.get(1).copied();
+                        return;
+                    }
+                    // Everything else carries its payload in the first byte;
+                    // an empty value is a no-op for all of them.
+                    if let Some(&byte) = cmd.value.first() {
+                        match cmd.identifier {
+                            ControlCommandIdentifiers::ListeningMode => {
+                                state.listening_mode = AirPodsNoiseControlMode::from_byte(byte);
+                            }
+                            // Toggles use 0x01 = enabled, 0x02 = disabled on the wire.
+                            ControlCommandIdentifiers::AllowOffOption => {
+                                state.allow_off_mode = byte == 0x01;
+                            }
+                            ControlCommandIdentifiers::ConversationDetectConfig => {
+                                state.conversation_awareness = byte == 0x01;
+                            }
+                            ControlCommandIdentifiers::AllowAutoConnect => {
+                                state.auto_connect = Some(byte == 0x01);
+                            }
+                            ControlCommandIdentifiers::EarDetectionConfig => {
+                                state.ear_detection_enabled = Some(byte == 0x01);
+                            }
+                            ControlCommandIdentifiers::ListeningModeConfigs => {
+                                state.listening_mode_configs = Some(byte);
+                            }
+                            ControlCommandIdentifiers::SleepDetectionConfig => {
+                                state.sleep_detection = Some(byte == 0x01);
+                            }
+                            ControlCommandIdentifiers::InCaseToneConfig => {
+                                state.in_case_tone = Some(byte == 0x01);
+                            }
+                            ControlCommandIdentifiers::InCaseToneVolume => {
+                                state.in_case_tone_volume = Some(byte);
+                            }
+                            ControlCommandIdentifiers::CrownRotationDirection => {
+                                state.crown_reversed = Some(byte == 0x01);
+                            }
+                            ControlCommandIdentifiers::OneBudAncMode => {
+                                state.one_bud_anc = byte == 0x01;
+                            }
+                            ControlCommandIdentifiers::VolumeSwipeMode => {
+                                state.volume_swipe = byte == 0x01;
+                            }
+                            ControlCommandIdentifiers::AdaptiveVolumeConfig => {
+                                state.adaptive_volume = byte == 0x01;
+                            }
+                            ControlCommandIdentifiers::DoubleClickInterval => {
+                                state.press_speed = Some(byte);
+                            }
+                            ControlCommandIdentifiers::ClickHoldInterval => {
+                                state.press_hold_duration = Some(byte);
+                            }
+                            ControlCommandIdentifiers::ChimeVolume => {
+                                state.tone_volume = Some(byte);
+                            }
+                            ControlCommandIdentifiers::VolumeSwipeInterval => {
+                                state.volume_swipe_length = Some(byte);
+                            }
+                            ControlCommandIdentifiers::AutoAncStrength => {
+                                state.adaptive_noise_level = Some(byte);
+                            }
+                            ControlCommandIdentifiers::MicMode => {
+                                // Wire: 0x00 = Automatic, 0x01 = Right, 0x02 = Left;
+                                // stored as-is, the Enum options follow this order.
+                                state.mic_mode = Some(byte.min(2));
+                            }
+                            ControlCommandIdentifiers::VoiceTrigger => {
+                                state.siri_voice_trigger = Some(byte == 0x01);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                AACPEvent::ControlCommand(cmd) => match cmd.identifier {
-                    ControlCommandIdentifiers::ListeningMode => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.listening_mode = AirPodsNoiseControlMode::from_byte(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::AllowOffOption => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.allow_off_mode = *byte != 0x00;
-                        }
-                    }
-                    ControlCommandIdentifiers::ConversationDetectConfig => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.conversation_awareness = *byte == 0x01;
-                        }
-                    }
-                    ControlCommandIdentifiers::AllowAutoConnect => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.auto_connect = Some(*byte != 0x00);
-                        }
-                    }
-                    ControlCommandIdentifiers::OneBudAncMode => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.one_bud_anc = *byte == 0x01;
-                        }
-                    }
-                    ControlCommandIdentifiers::VolumeSwipeMode => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.volume_swipe = *byte == 0x01;
-                        }
-                    }
-                    ControlCommandIdentifiers::AdaptiveVolumeConfig => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.adaptive_volume = *byte == 0x01;
-                        }
-                    }
-                    ControlCommandIdentifiers::DoubleClickInterval => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.press_speed = Some(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::ClickHoldInterval => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.press_hold_duration = Some(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::ChimeVolume => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.tone_volume = Some(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::VolumeSwipeInterval => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.volume_swipe_length = Some(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::AutoAncStrength => {
-                        if let Some(byte) = cmd.value.first() {
-                            state.adaptive_noise_level = Some(*byte);
-                        }
-                    }
-                    ControlCommandIdentifiers::MicMode => {
-                        if let Some(byte) = cmd.value.first() {
-                            // AACP uses 1-indexed (0x01=Left, 0x02=Right, 0x03=Auto)
-                            // We store 0-indexed for the Enum widget
-                            state.mic_mode = Some(byte.saturating_sub(1));
-                        }
-                    }
-                    _ => {}
-                },
                 _ => {}
             }
         }
@@ -510,6 +647,18 @@ impl App {
             log::warn!("Failed to send rename '{}': {}", name, e);
         }
     }
+
+}
+
+/// Map the ClickHoldMode wire value (0x01 = Noise Control, 0x05 = Siri)
+/// to the 0/1 index used by the Hold Left/Right rows.
+pub fn hold_wire_to_idx(v: u8) -> u8 {
+    if v == 0x05 { 1 } else { 0 }
+}
+
+/// Inverse of [`hold_wire_to_idx`].
+pub fn hold_idx_to_wire(idx: u8) -> u8 {
+    if idx == 1 { 0x05 } else { 0x01 }
 }
 
 /// Describes a single settings row, used by both UI and event handling.
@@ -532,6 +681,18 @@ pub enum SettingsItem {
         min: u8,
         max: u8,
         cmd: ControlCommandIdentifiers,
+    },
+    /// One bit of the long-press noise-cycle bitmask (0x1A).
+    CycleBit {
+        label: &'static str,
+        bit: u8,
+        value: bool,
+    },
+    /// Press-and-hold action for one bud (0x16): 0 = Noise Control, 1 = Siri.
+    HoldMode {
+        label: &'static str,
+        right: bool,
+        value: u8,
     },
 }
 
@@ -717,12 +878,15 @@ mod tests {
         assert_eq!(s.ear_right, Some(EarDetectionStatus::OutOfEar));
     }
 
-    #[test]
-    fn eq_data_event_stores_bands() {
-        let (mut app, _) = mk_app();
-        app.handle_event(connected(MAC, "Pods", PRO2));
-        app.handle_event(aacp(MAC, AE::EqData([1, 2, 3, 4, 5, 6, 7, 8])));
-        assert_eq!(airpods(&app, MAC).eq_bands, Some([1, 2, 3, 4, 5, 6, 7, 8]));
+    /// Label of any settings row.
+    fn item_label(i: &SettingsItem) -> &'static str {
+        match i {
+            SettingsItem::Toggle { label, .. } => label,
+            SettingsItem::Enum { label, .. } => label,
+            SettingsItem::Slider { label, .. } => label,
+            SettingsItem::CycleBit { label, .. } => label,
+            SettingsItem::HoldMode { label, .. } => label,
+        }
     }
 
     fn cc(id: ControlCommandIdentifiers, val: u8) -> AE {
@@ -786,15 +950,7 @@ mod tests {
     fn settings_items_for_pro2_includes_stem_and_ca() {
         let (mut app, _) = mk_app();
         app.handle_event(connected(MAC, "Pods", PRO2));
-        let labels: Vec<&str> = app
-            .settings_items()
-            .iter()
-            .map(|i| match i {
-                SettingsItem::Toggle { label, .. } => *label,
-                SettingsItem::Enum { label, .. } => *label,
-                SettingsItem::Slider { label, .. } => *label,
-            })
-            .collect();
+        let labels: Vec<&str> = app.settings_items().iter().map(item_label).collect();
         assert!(labels.contains(&"Conversation Awareness"));
         assert!(labels.contains(&"NC with One AirPod"));
         assert!(labels.contains(&"Press Speed"));
@@ -806,15 +962,7 @@ mod tests {
     fn settings_items_for_airpods3_no_anc_skips_anc_specific() {
         let (mut app, _) = mk_app();
         app.handle_event(connected(MAC, "Pods", AIRPODS3));
-        let labels: Vec<&str> = app
-            .settings_items()
-            .iter()
-            .map(|i| match i {
-                SettingsItem::Toggle { label, .. } => *label,
-                SettingsItem::Enum { label, .. } => *label,
-                SettingsItem::Slider { label, .. } => *label,
-            })
-            .collect();
+        let labels: Vec<&str> = app.settings_items().iter().map(item_label).collect();
         // No ANC → no Conversation Awareness, no One-Bud ANC
         assert!(!labels.contains(&"Conversation Awareness"));
         assert!(!labels.contains(&"NC with One AirPod"));
@@ -826,15 +974,7 @@ mod tests {
     fn settings_items_for_max_no_stem_skips_stem_items() {
         let (mut app, _) = mk_app();
         app.handle_event(connected(MAC, "Max", MAX));
-        let labels: Vec<&str> = app
-            .settings_items()
-            .iter()
-            .map(|i| match i {
-                SettingsItem::Toggle { label, .. } => *label,
-                SettingsItem::Enum { label, .. } => *label,
-                SettingsItem::Slider { label, .. } => *label,
-            })
-            .collect();
+        let labels: Vec<&str> = app.settings_items().iter().map(item_label).collect();
         assert!(!labels.contains(&"Press Speed"));
         assert!(!labels.contains(&"Volume Swipe"));
         assert!(!labels.contains(&"Volume Swipe Length"));

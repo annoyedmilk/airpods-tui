@@ -28,75 +28,26 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         // Up/Down: navigate within current section
-        KeyCode::Up if app.section_row > 0 => {
-            app.section_row -= 1;
-        }
-        KeyCode::Down => {
-            let max = section_max_row(app);
-            if app.section_row < max {
-                app.section_row += 1;
-            }
-        }
+        KeyCode::Up => move_row(app, -1),
+        KeyCode::Down => move_row(app, 1),
 
-        // Left/Right: adjust sliders/enums in Settings, switch device tab otherwise
+        // Left/Right: adjust the focused row in Settings, switch device tab otherwise
         KeyCode::Left => {
-            if app.focused_section == FocusedSection::Settings
-                && let Some(item) = current_settings_item(app)
-            {
-                match item {
-                    SettingsItem::Slider {
-                        value, min, cmd, ..
-                    } => {
-                        let new_val = value.saturating_sub(5).max(min);
-                        send_setting(app, cmd, new_val);
-                        return;
-                    }
-                    SettingsItem::Enum { value, cmd, .. } => {
-                        if value > 0 {
-                            send_setting(app, cmd, value - 1);
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            if app.selected_device_idx > 0 {
+            if app.effective_section() == FocusedSection::Settings {
+                adjust_settings_item(app, -1);
+            } else if app.selected_device_idx > 0 {
                 app.selected_device_idx -= 1;
-                app.section_row = 0;
                 app.focused_section = FocusedSection::NoiseControl;
+                app.section_row = 0;
             }
         }
         KeyCode::Right => {
-            if app.focused_section == FocusedSection::Settings
-                && let Some(item) = current_settings_item(app)
-            {
-                match item {
-                    SettingsItem::Slider {
-                        value, max, cmd, ..
-                    } => {
-                        let new_val = (value + 5).min(max);
-                        send_setting(app, cmd, new_val);
-                        return;
-                    }
-                    SettingsItem::Enum {
-                        value,
-                        options,
-                        cmd,
-                        ..
-                    } => {
-                        let max_idx = (options.len() as u8).saturating_sub(1);
-                        if value < max_idx {
-                            send_setting(app, cmd, value + 1);
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            if app.selected_device_idx + 1 < app.device_order.len() {
+            if app.effective_section() == FocusedSection::Settings {
+                adjust_settings_item(app, 1);
+            } else if app.selected_device_idx + 1 < app.device_order.len() {
                 app.selected_device_idx += 1;
-                app.section_row = 0;
                 app.focused_section = FocusedSection::NoiseControl;
+                app.section_row = 0;
             }
         }
 
@@ -171,19 +122,125 @@ fn has_settings(app: &App) -> bool {
     matches!(app.selected_device(), Some(DeviceState::AirPods(s)) if s.has_anc)
 }
 
-fn section_max_row(app: &App) -> usize {
-    match app.focused_section {
-        FocusedSection::NoiseControl => app.noise_control_rows().saturating_sub(1),
-        FocusedSection::Settings => {
-            let items = app.settings_items();
-            items.len().saturating_sub(1)
-        }
+/// Move the cursor by `dir` within the focused section, clamped to its rows.
+fn move_row(app: &mut App, dir: i64) {
+    let max = match app.effective_section() {
+        FocusedSection::NoiseControl => app.noise_control_rows(),
+        FocusedSection::Settings => app.settings_items().len(),
     }
+    .saturating_sub(1);
+    app.section_row = app.section_row.saturating_add_signed(dir as isize).min(max);
 }
 
 fn current_settings_item(app: &App) -> Option<SettingsItem> {
     let items = app.settings_items();
     items.into_iter().nth(app.section_row)
+}
+
+/// Left/Right on a settings row: `dir` is -1 or 1.
+fn adjust_settings_item(app: &mut App, dir: i8) {
+    let Some(item) = current_settings_item(app) else {
+        return;
+    };
+    match item {
+        SettingsItem::Slider {
+            value,
+            min,
+            max,
+            cmd,
+            ..
+        } => {
+            let new_val = if dir < 0 {
+                value.saturating_sub(5).max(min)
+            } else {
+                (value + 5).min(max)
+            };
+            send_setting(app, cmd, new_val);
+        }
+        SettingsItem::Enum {
+            value,
+            options,
+            cmd,
+            ..
+        } => {
+            if dir < 0 {
+                if value > 0 {
+                    send_setting(app, cmd, value - 1);
+                }
+            } else {
+                let max_idx = (options.len() as u8).saturating_sub(1);
+                if value < max_idx {
+                    send_setting(app, cmd, value + 1);
+                }
+            }
+        }
+        SettingsItem::HoldMode { right, value, .. } => {
+            let new_idx = if dir < 0 { 0 } else { 1 };
+            if new_idx != value {
+                set_hold_mode(app, right, new_idx);
+            }
+        }
+        SettingsItem::CycleBit { bit, value, .. } => {
+            // Left removes the mode from the cycle, Right adds it.
+            let enable = dir > 0;
+            if enable != value {
+                toggle_cycle_bit(app, bit);
+            }
+        }
+        SettingsItem::Toggle { .. } => {}
+    }
+}
+
+/// Update one bud's press-and-hold action and send both buds' wire bytes
+/// (ClickHoldMode is a two-byte command: [right, left]).
+fn set_hold_mode(app: &mut App, right: bool, idx: u8) {
+    let Some(mac) = app.selected_mac().cloned() else {
+        return;
+    };
+    let wire = crate::tui::app::hold_idx_to_wire(idx);
+    let (right_wire, left_wire) = {
+        let Some(DeviceState::AirPods(s)) = app.devices.get_mut(&mac) else {
+            return;
+        };
+        if right {
+            s.hold_right = Some(wire);
+        } else {
+            s.hold_left = Some(wire);
+        }
+        (s.hold_right.unwrap_or(0x01), s.hold_left.unwrap_or(0x01))
+    };
+    app.send_command(
+        &mac,
+        ControlCommandIdentifiers::ClickHoldMode,
+        vec![right_wire, left_wire],
+    );
+}
+
+/// Toggle one mode's membership in the long-press noise cycle.
+fn toggle_cycle_bit(app: &mut App, bit: u8) {
+    let Some(mac) = app.selected_mac().cloned() else {
+        return;
+    };
+    let new_mask = {
+        let Some(DeviceState::AirPods(s)) = app.devices.get_mut(&mac) else {
+            return;
+        };
+        let Some(mask) = s.listening_mode_configs else {
+            return;
+        };
+        let new_mask = mask ^ bit;
+        // The device needs at least two modes to cycle between.
+        if new_mask.count_ones() < 2 {
+            return;
+        }
+        s.listening_mode_configs = Some(new_mask);
+        new_mask
+    };
+    app.send_command(
+        &mac,
+        ControlCommandIdentifiers::ListeningModeConfigs,
+        vec![new_mask],
+    );
 }
 
 fn send_setting(app: &mut App, cmd: ControlCommandIdentifiers, value: u8) {
@@ -201,14 +258,23 @@ fn send_setting(app: &mut App, cmd: ControlCommandIdentifiers, value: u8) {
             }
             ControlCommandIdentifiers::AutoAncStrength => state.adaptive_noise_level = Some(value),
             ControlCommandIdentifiers::MicMode => state.mic_mode = Some(value),
+            ControlCommandIdentifiers::InCaseToneVolume => state.in_case_tone_volume = Some(value),
+            ControlCommandIdentifiers::CrownRotationDirection => {
+                state.crown_reversed = Some(value == 1)
+            }
             _ => {}
         }
     }
-    // MicMode uses 1-indexed AACP values (0x01=Left, 0x02=Right, 0x03=Auto)
-    let wire_value = if cmd == ControlCommandIdentifiers::MicMode {
-        value + 1
-    } else {
-        value
+    let wire_value = match cmd {
+        // Crown: UI 0 = Default (wire 0x02), UI 1 = Reversed (wire 0x01)
+        ControlCommandIdentifiers::CrownRotationDirection => {
+            if value == 1 {
+                0x01
+            } else {
+                0x02
+            }
+        }
+        _ => value,
     };
     app.send_command(&mac, cmd, vec![wire_value]);
 }
@@ -217,8 +283,11 @@ fn set_noise_mode(app: &mut App, mode: AirPodsNoiseControlMode) {
     let Some(mac) = app.selected_mac().cloned() else {
         return;
     };
-    if let Some(DeviceState::AirPods(state)) = app.devices.get_mut(&mac) {
-        state.listening_mode = mode.clone();
+    match app.devices.get_mut(&mac) {
+        Some(DeviceState::AirPods(state)) if state.has_anc => {
+            state.listening_mode = mode.clone();
+        }
+        _ => return,
     }
     app.send_command(
         &mac,
@@ -232,7 +301,13 @@ fn toggle_conversation_awareness(app: &mut App) {
         return;
     };
     let new_val = match app.devices.get(&mac) {
-        Some(DeviceState::AirPods(s)) => !s.conversation_awareness,
+        Some(DeviceState::AirPods(s))
+            if s.has_anc
+                && crate::devices::apple_models::model_info(s.product_id)
+                    .has_conversation_awareness =>
+        {
+            !s.conversation_awareness
+        }
         _ => return,
     };
     if let Some(DeviceState::AirPods(s)) = app.devices.get_mut(&mac) {
@@ -246,7 +321,7 @@ fn toggle_conversation_awareness(app: &mut App) {
 }
 
 fn activate_row(app: &mut App) {
-    match app.focused_section {
+    match app.effective_section() {
         FocusedSection::NoiseControl => activate_noise_row(app),
         FocusedSection::Settings => activate_settings_row(app),
     }
@@ -295,6 +370,15 @@ fn activate_settings_row(app: &mut App) {
                     ControlCommandIdentifiers::AllowAutoConnect => {
                         state.auto_connect = Some(new_val)
                     }
+                    ControlCommandIdentifiers::EarDetectionConfig => {
+                        state.ear_detection_enabled = Some(new_val)
+                    }
+                    ControlCommandIdentifiers::SleepDetectionConfig => {
+                        state.sleep_detection = Some(new_val)
+                    }
+                    ControlCommandIdentifiers::InCaseToneConfig => {
+                        state.in_case_tone = Some(new_val)
+                    }
                     _ => {}
                 }
             }
@@ -315,8 +399,10 @@ fn activate_settings_row(app: &mut App) {
             };
             send_setting(app, cmd, next);
         }
+        SettingsItem::CycleBit { bit, .. } => toggle_cycle_bit(app, bit),
+        SettingsItem::HoldMode { right, value, .. } => set_hold_mode(app, right, 1 - value),
         SettingsItem::Slider { .. } => {
-            // Sliders are adjusted with Left/Right, not Space/Enter
+            // Sliders are adjusted with Left/Right.
         }
     }
 }
@@ -409,6 +495,48 @@ mod tests {
         let before = app.focused_section;
         handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.focused_section, before);
+    }
+
+    #[test]
+    fn noise_shortcuts_noop_without_anc() {
+        let (mut app, mut cmd_rx) = mk_app(AIRPODS3);
+        handle_key(&mut app, key(KeyCode::Char('1')));
+        handle_key(&mut app, key(KeyCode::Char('2')));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ca_toggle_noop_without_conversation_awareness() {
+        // AirPods Pro 1: ANC yes, Conversation Awareness no.
+        let (mut app, mut cmd_rx) = mk_app(0x200e);
+        handle_key(&mut app, key(KeyCode::Char('c')));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn non_anc_device_falls_through_to_settings() {
+        let (mut app, mut cmd_rx) = mk_app(AIRPODS3);
+        // Without noise control rows, Space acts on the Settings section.
+        assert_eq!(app.effective_section(), FocusedSection::Settings);
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        let (_, cmd) = cmd_rx.try_recv().expect("settings toggle sent");
+        match cmd {
+            DeviceCommand::ControlCommand(id, _) => {
+                // First selectable row for a non-ANC stem model is Volume Swipe.
+                assert_eq!(id, ControlCommandIdentifiers::VolumeSwipeMode);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn non_anc_device_down_clamps_to_settings_rows() {
+        let (mut app, _) = mk_app(AIRPODS3);
+        let max = app.settings_items().len() - 1;
+        for _ in 0..20 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        assert_eq!(app.section_row, max);
     }
 
     #[test]
@@ -552,9 +680,10 @@ mod tests {
             s.tone_volume = Some(50);
         }
         handle_key(&mut app, key(KeyCode::Tab)); // → Settings
-        // Walk down to "Tone Volume" — for PRO2, ordered: CA, OneBudANC, Personalized Volume,
-        // Volume Swipe, Press Speed, Press & Hold, Tone Volume
-        for _ in 0..6 {
+        // Walk down to "Tone Volume"; headers are skipped: CA, OneBudANC,
+        // Volume Swipe, Swipe Length, Press Speed, Press & Hold,
+        // Personalized Volume, Tone Volume
+        for _ in 0..7 {
             handle_key(&mut app, key(KeyCode::Down));
         }
         handle_key(&mut app, key(KeyCode::Left));
@@ -575,7 +704,7 @@ mod tests {
             s.tone_volume = Some(15); // = min
         }
         handle_key(&mut app, key(KeyCode::Tab));
-        for _ in 0..6 {
+        for _ in 0..7 {
             handle_key(&mut app, key(KeyCode::Down));
         }
         handle_key(&mut app, key(KeyCode::Left));
@@ -593,7 +722,7 @@ mod tests {
             s.tone_volume = Some(98);
         }
         handle_key(&mut app, key(KeyCode::Tab));
-        for _ in 0..6 {
+        for _ in 0..7 {
             handle_key(&mut app, key(KeyCode::Down));
         }
         handle_key(&mut app, key(KeyCode::Right));
@@ -664,29 +793,115 @@ mod tests {
     }
 
     #[test]
-    fn mic_mode_setting_writes_one_indexed_wire_value() {
+    fn mic_mode_setting_writes_wire_value_directly() {
         let (mut app, mut cmd_rx) = mk_app(PRO2);
-        // Force MicMode value, then dispatch through enum Right/Left from Settings
         if let Some(DeviceState::AirPods(s)) = app.devices.get_mut(MAC_A) {
-            s.mic_mode = Some(0); // Always Left (UI 0-indexed)
+            s.mic_mode = Some(0); // Automatic
         }
-        // Walk to Mic Mode row — for PRO2 with default state the order is:
-        // CA, OneBudANC, Personalized Vol, Volume Swipe, Press Speed, Press & Hold,
-        // Tone Volume, Volume Swipe Length, Mic Mode
         handle_key(&mut app, key(KeyCode::Tab));
-        for _ in 0..8 {
-            handle_key(&mut app, key(KeyCode::Down));
-        }
+        let row = app
+            .settings_items()
+            .iter()
+            .position(|i| matches!(i, SettingsItem::Enum { label, .. } if *label == "Mic Mode"))
+            .unwrap();
+        app.section_row = row;
         handle_key(&mut app, key(KeyCode::Right));
         let (_, cmd) = cmd_rx.try_recv().expect("mic mode command");
         match cmd {
             DeviceCommand::ControlCommand(id, val) => {
                 assert_eq!(id, ControlCommandIdentifiers::MicMode);
-                // UI new value = 1 → wire = 1 + 1 = 2
-                assert_eq!(val, vec![2]);
+                // Option index == wire value: 1 = Always Right (0x01).
+                assert_eq!(val, vec![1]);
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn cycle_bit_toggle_keeps_at_least_two_modes() {
+        let (mut app, mut cmd_rx) = mk_app(PRO2);
+        if let Some(DeviceState::AirPods(s)) = app.devices.get_mut(MAC_A) {
+            s.listening_mode_configs = Some(0x06); // NC + Transparency
+        }
+        handle_key(&mut app, key(KeyCode::Tab)); // → Settings
+        let items = app.settings_items();
+        let row = items
+            .iter()
+            .position(
+                |i| matches!(i, SettingsItem::CycleBit { label, .. } if *label == "Hold Cycle: Noise Cancellation"),
+            )
+            .unwrap();
+        app.section_row = row;
+        // Removing NC would leave only Transparency → must be refused.
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(
+            match app.devices.get(MAC_A) {
+                Some(DeviceState::AirPods(s)) => s.listening_mode_configs,
+                _ => None,
+            },
+            Some(0x06)
+        );
+        // Adding Adaptive is fine: mask 0x06 → 0x0E.
+        let row = app
+            .settings_items()
+            .iter()
+            .position(
+                |i| matches!(i, SettingsItem::CycleBit { label, .. } if *label == "Hold Cycle: Adaptive"),
+            )
+            .unwrap();
+        app.section_row = row;
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        let (_, cmd) = cmd_rx.try_recv().expect("mask sent");
+        assert!(matches!(
+            cmd,
+            DeviceCommand::ControlCommand(ControlCommandIdentifiers::ListeningModeConfigs, ref v)
+                if v == &vec![0x0E]
+        ));
+    }
+
+    #[test]
+    fn hold_mode_sends_both_buds_wire_bytes() {
+        let (mut app, mut cmd_rx) = mk_app(PRO2);
+        if let Some(DeviceState::AirPods(s)) = app.devices.get_mut(MAC_A) {
+            s.hold_left = Some(0x01); // Noise Control
+            s.hold_right = Some(0x01);
+        }
+        let row = app
+            .settings_items()
+            .iter()
+            .position(
+                |i| matches!(i, SettingsItem::HoldMode { label, .. } if *label == "Hold Left"),
+            )
+            .unwrap();
+        app.focused_section = FocusedSection::Settings;
+        app.section_row = row;
+        // Switch left bud to Siri: wire = [right, left] = [0x01, 0x05].
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        let (_, cmd) = cmd_rx.try_recv().expect("hold mode sent");
+        assert!(matches!(
+            cmd,
+            DeviceCommand::ControlCommand(ControlCommandIdentifiers::ClickHoldMode, ref v)
+                if v == &vec![0x01, 0x05]
+        ));
+    }
+
+    #[test]
+    fn up_down_clamp_to_settings_rows() {
+        let (mut app, _) = mk_app(PRO2);
+        handle_key(&mut app, key(KeyCode::Tab)); // → Settings, lands on row 0
+        assert_eq!(app.section_row, 0);
+        let items = app.settings_items();
+        // Walk past the end: cursor clamps to the last row.
+        for _ in 0..items.len() + 2 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        assert_eq!(app.section_row, items.len() - 1);
+        // And back up: clamps to the first row.
+        for _ in 0..items.len() + 2 {
+            handle_key(&mut app, key(KeyCode::Up));
+        }
+        assert_eq!(app.section_row, 0);
     }
 
     #[test]

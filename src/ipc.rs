@@ -116,9 +116,6 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                 AE::ConnectedDevices(_, _) => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::ConnectedDevices(_, _))));
                 }
-                AE::EqData(_) => {
-                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EqData(_))));
-                }
                 // Transient events (StemPress, AudioSource, etc.) are not
                 // meaningful to replay — skip storing them in the snapshot.
                 _ => return,

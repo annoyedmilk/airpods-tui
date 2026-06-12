@@ -6,22 +6,24 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 
 ## Features
 
-- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications
+- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications. The case reports its level whenever a pod sits inside; the last known value is retained while you wear both pods
 - **Noise control**: Off, Transparency, Adaptive, Noise Cancellation (model-aware, Adaptive only shown on capable devices)
 - **Settings panel**, dynamically built per model:
   - Conversation Awareness (Pro 2, Pro 3, Pro USB-C, 4 ANC, Max 2)
-  - NC with One AirPod (any ANC-capable model)
-  - Personalized Volume
-  - Volume Swipe + Volume Swipe Length (stem-equipped models)
-  - Press Speed, Press & Hold (stem-equipped models)
-  - Tone Volume slider
   - Adaptive Noise Level slider (adaptive-capable models)
-  - Mic Mode (Auto / Always Right / Always Left)
-  - Auto Connect
+  - NC with One AirPod (any ANC-capable model)
+  - Volume Swipe + Volume Swipe Length, Press Speed, Press & Hold (stem-equipped models)
+  - Press-and-hold action per bud: Noise Control or Siri
+  - Hold Cycle membership (which of Off / NC / Transparency / Adaptive the press-and-hold cycles through)
+  - Crown Direction (AirPods Max)
+  - Personalized Volume, Tone Volume, In-Case Tone + In-Case Tone Volume
+  - Mic Mode (Automatic / Always Right / Always Left)
+  - Siri Voice Trigger
+  - Auto Ear Detection, Sleep Detection, Auto Connect
 - **Ear detection** status in the header
 - **Stem press media controls** (play/pause, next/prev) wired through MPRIS
 - **Device renaming**: sets both the AACP name and the BlueZ alias
-- **Volume swipe synced** to system volume via configurable commands
+- **Volume swipe synced** to system volume via configurable commands; your Volume Swipe on/off choice is remembered per device and re-applied on connect
 - **Auto audio rerouting** to AirPods on connect
 - **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership, resumes when the AirPods return to Linux
 - **Waybar integration** via JSON output (`--waybar` / `--waybar-watch`)
@@ -84,6 +86,29 @@ systemctl --user enable --now airpods-tui.service
 
 The daemon owns the AACP session so the TUI launches instantly via the IPC socket. Logs: `journalctl --user -u airpods-tui`.
 
+### Floating window (Hyprland / Omarchy, optional)
+
+Omarchy launches its own TUIs (bluetui, impala, btop) as centered floating
+windows. To get the same for airpods-tui, add to `~/.config/hypr/hyprland.conf`:
+
+```ini
+windowrule = float on, match:class org.omarchy.airpods-tui
+windowrule = center on, match:class org.omarchy.airpods-tui
+windowrule = size 615 486, match:class org.omarchy.airpods-tui
+```
+
+The size fits the TUI (82×28 cells) at Omarchy's default terminal font
+(JetBrainsMono 9pt, 14px padding); adjust if you use a different font or size.
+Don't use Omarchy's `tag +floating-window` shortcut here, because its generic
+`size 875 600` rule is applied in a later pass and overrides any
+class-matched size.
+
+Launch or focus the window with the stock Omarchy helper:
+
+```bash
+omarchy-launch-or-focus-tui airpods-tui
+```
+
 ### Waybar module (optional)
 
 Add to `~/.config/waybar/config.jsonc` modules list:
@@ -93,14 +118,14 @@ Add to `~/.config/waybar/config.jsonc` modules list:
     "exec": "airpods-tui --waybar-watch",
     "return-type": "json",
     "format": "󰎈 {}",
-    "on-click": "omarchy-launch-airpods"
+    "on-click": "omarchy-launch-or-focus-tui airpods-tui"
 }
 ```
 
 Add `"custom/airpods"` to your bar's `modules-right` (or wherever you prefer) and restart Waybar:
 
 ```bash
-omarchy-restart-waybar
+omarchy restart waybar
 ```
 
 ## Usage
@@ -136,7 +161,7 @@ Optional config at `~/.config/airpods-tui/config.toml`:
 # Show OSD on volume change ({} is replaced with the signed delta, e.g. "+5")
 volume_osd_command = ["swayosd-client", "--output-volume", "{}"]
 
-# Apply absolute volume ({} is replaced with a 0.0–1.0 fraction)
+# Apply absolute volume ({} is replaced with a 0.0 to 1.0 fraction)
 volume_set_command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "{}"]
 
 # Battery-low desktop notification ({} is replaced with "Left battery: 18%" etc.)

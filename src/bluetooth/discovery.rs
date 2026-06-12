@@ -2,7 +2,9 @@ use bluer::Adapter;
 use std::io::Error;
 
 pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<bluer::Device> {
-    let target_uuid = uuid::uuid!("74ec2172-0bad-4d01-8f77-997b2be0722a");
+    let target_uuid = crate::bluetooth::AIRPODS_AACP_UUID
+        .parse::<uuid::Uuid>()
+        .expect("AIRPODS_AACP_UUID is a valid UUID");
 
     let addrs = adapter.device_addresses().await?;
     for addr in addrs {

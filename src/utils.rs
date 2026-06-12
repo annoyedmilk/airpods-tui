@@ -28,17 +28,15 @@ pub fn write_battery_env(
         }
     };
     let mut content = String::new();
-    if let Some(l) = left {
-        content.push_str(&format!("LEFT={}\n", l));
-    }
-    if let Some(r) = right {
-        content.push_str(&format!("RIGHT={}\n", r));
-    }
-    if let Some(c) = case {
-        content.push_str(&format!("CASE={}\n", c));
-    }
-    if let Some(h) = headphone {
-        content.push_str(&format!("HEADPHONE={}\n", h));
+    for (key, val) in [
+        ("LEFT", left),
+        ("RIGHT", right),
+        ("CASE", case),
+        ("HEADPHONE", headphone),
+    ] {
+        if let Some(v) = val {
+            content.push_str(&format!("{key}={v}\n"));
+        }
     }
     if let Err(e) = std::fs::write(dir.join("airpods-battery.env"), content) {
         log::warn!("Failed to write airpods-battery.env: {}", e);

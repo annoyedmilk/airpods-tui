@@ -34,7 +34,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(if app.device_order.len() > 1 { 2 } else { 0 }),
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // single-line key hint footer
         ])
         .split(col);
 
@@ -119,13 +119,16 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
     let bat_count = bat_entries.len().max(1) as u16;
     let display_name = state.model.as_deref().unwrap_or(&state.name);
 
-    // Battery-only view for non-ANC devices
+    // No noise control box for non-ANC devices; settings still apply.
     if !state.has_anc {
+        let settings_items = app.settings_items();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),             // name line
                 Constraint::Length(bat_count + 2), // battery box
+                // Settings box sized to content; spare space stays empty
+                Constraint::Max(settings_items.len() as u16 + 2),
                 Constraint::Fill(1),
             ])
             .split(area);
@@ -136,11 +139,17 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
             chunks[0],
         );
         draw_battery_box(f, chunks[1], &bat_entries);
+
+        let st_focused = app.effective_section() == FocusedSection::Settings;
+        let st_block = section_block("Settings", st_focused);
+        let st_inner = st_block.inner(chunks[2]);
+        f.render_widget(st_block, chunks[2]);
+        draw_settings_table(f, st_inner, &settings_items, app.section_row, st_focused);
         return;
     }
 
     // Full ANC view with boxes
-    let noise_count = if state.has_adaptive { 3u16 } else { 2 };
+    let noise_count = noise_mode_list(state.has_adaptive, state.allow_off_mode).len() as u16;
     let settings_items = app.settings_items();
 
     let chunks = Layout::default()
@@ -149,7 +158,9 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
             Constraint::Length(1),               // name line
             Constraint::Length(bat_count + 2),   // Battery box
             Constraint::Length(noise_count + 2), // Noise Control box
-            Constraint::Fill(1),                 // Settings box
+            // Settings box sized to content; spare space stays empty
+            Constraint::Max(settings_items.len() as u16 + 2),
+            Constraint::Fill(1),
         ])
         .split(area);
 
@@ -265,15 +276,29 @@ fn draw_settings_table(
                 Style::default().fg(DIM)
             };
 
+            let toggle_row = |label: &'static str, value: bool| {
+                let val_str = if value { "On" } else { "Off" };
+                let val_color = if value { ACCENT } else { DIM };
+                Row::new(vec![
+                    Line::from(vec![cursor.clone(), Span::styled(label, label_style)]),
+                    Line::from(Span::styled(
+                        val_str,
+                        Style::default().fg(val_color).add_modifier(Modifier::BOLD),
+                    ))
+                    .alignment(Alignment::Right),
+                ])
+            };
+
             match item {
-                SettingsItem::Toggle { label, value, .. } => {
-                    let val_str = if *value { "On" } else { "Off" };
-                    let val_color = if *value { ACCENT } else { DIM };
+                SettingsItem::Toggle { label, value, .. } => toggle_row(label, *value),
+                SettingsItem::CycleBit { label, value, .. } => toggle_row(label, *value),
+                SettingsItem::HoldMode { label, value, .. } => {
+                    let val_str = if *value == 1 { "Siri" } else { "Noise Control" };
                     Row::new(vec![
-                        Line::from(vec![cursor, Span::styled(*label, label_style)]),
+                        Line::from(vec![cursor.clone(), Span::styled(*label, label_style)]),
                         Line::from(Span::styled(
                             val_str,
-                            Style::default().fg(val_color).add_modifier(Modifier::BOLD),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                         ))
                         .alignment(Alignment::Right),
                     ])
@@ -286,7 +311,7 @@ fn draw_settings_table(
                 } => {
                     let val_str = options.get(*value as usize).unwrap_or(&"?");
                     Row::new(vec![
-                        Line::from(vec![cursor, Span::styled(*label, label_style)]),
+                        Line::from(vec![cursor.clone(), Span::styled(*label, label_style)]),
                         Line::from(Span::styled(
                             *val_str,
                             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -313,7 +338,7 @@ fn draw_settings_table(
                         value
                     );
                     Row::new(vec![
-                        Line::from(vec![cursor, Span::styled(*label, label_style)]),
+                        Line::from(vec![cursor.clone(), Span::styled(*label, label_style)]),
                         Line::from(Span::styled(
                             bar,
                             Style::default().fg(if is_selected { ACCENT } else { Color::Gray }),
@@ -439,30 +464,40 @@ fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![
-        Span::styled("q", Style::default().fg(ACCENT)),
-        Span::styled(" quit", Style::default().fg(DIM)),
-        Span::styled("  tab", Style::default().fg(ACCENT)),
-        Span::styled(" section", Style::default().fg(DIM)),
-        Span::styled("  ↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" navigation", Style::default().fg(DIM)),
-        Span::styled("  space", Style::default().fg(ACCENT)),
-        Span::styled(" select", Style::default().fg(DIM)),
-        Span::styled("  1-3", Style::default().fg(ACCENT)),
-        Span::styled(" noise", Style::default().fg(DIM)),
-        Span::styled("  r", Style::default().fg(ACCENT)),
-        Span::styled(" rename", Style::default().fg(DIM)),
-        Span::styled("  i", Style::default().fg(ACCENT)),
-        Span::styled(" info", Style::default().fg(DIM)),
-    ];
+    let has_anc = matches!(
+        app.selected_device(),
+        Some(DeviceState::AirPods(s)) if s.has_anc
+    );
+    let hint = |key: &'static str, action: &'static str| {
+        [
+            Span::styled(key, Style::default().fg(ACCENT)),
+            Span::styled(" ", Style::default()),
+            Span::styled(action, Style::default().fg(DIM)),
+            Span::styled("  ", Style::default()),
+        ]
+    };
+
+    let mut hints: Vec<Span> = Vec::new();
+    if has_anc {
+        hints.extend(hint("tab", "section"));
+    }
+    hints.extend(hint("↑↓", "navigate"));
+    hints.extend(hint("space", "select"));
+    if has_anc {
+        hints.extend(hint("1-3", "noise"));
+    }
+    hints.extend(hint("r", "rename"));
+    hints.extend(hint("i", "info"));
+    hints.extend(hint("q", "quit"));
     if app.audio_unavailable {
-        spans.push(Span::styled(
-            "  PulseAudio unavailable",
+        hints.push(Span::styled(
+            "PulseAudio unavailable",
             Style::default().fg(Color::Red),
         ));
     }
+
     f.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        Paragraph::new(Line::from(hints)).alignment(Alignment::Center),
         area,
     );
 }
@@ -523,7 +558,7 @@ fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
         ("R Serial", state.right_serial.as_deref()),
     ];
     let row_count = fields.iter().filter(|(_, v)| v.is_some()).count() as u16;
-    let popup_h = row_count + 2; // +2 for border
+    let popup_h = row_count.max(1) + 2; // +2 for border
     let popup_w = 50u16.min(area.width);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
@@ -543,6 +578,15 @@ fn draw_info_popup(f: &mut Frame, area: Rect, state: &AirPodsDeviceState) {
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
+
+    if row_count == 0 {
+        // The device sends its info packet a few seconds after connecting.
+        f.render_widget(
+            Paragraph::new("Waiting for device information…").style(Style::default().fg(DIM)),
+            inner,
+        );
+        return;
+    }
 
     let rows: Vec<Row> = fields
         .iter()

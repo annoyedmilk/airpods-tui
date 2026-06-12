@@ -23,7 +23,7 @@ impl AirPodsDevice {
         app_tx: UnboundedSender<AppEvent>,
         product_id: u16,
         config: Config,
-        reconnect_tx: Option<tokio::sync::mpsc::UnboundedSender<(Address, String, u16)>>,
+        reconnect_tx: Option<tokio::sync::mpsc::UnboundedSender<(Address, u16)>>,
     ) -> Result<Self, bluer::Error> {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -64,6 +64,14 @@ impl AirPodsDevice {
             ControlCommandIdentifiers::VolumeSwipeInterval,
             ControlCommandIdentifiers::AutoAncStrength,
             ControlCommandIdentifiers::MicMode,
+            ControlCommandIdentifiers::EarDetectionConfig,
+            ControlCommandIdentifiers::ListeningModeConfigs,
+            ControlCommandIdentifiers::ClickHoldMode,
+            ControlCommandIdentifiers::SleepDetectionConfig,
+            ControlCommandIdentifiers::VoiceTrigger,
+            ControlCommandIdentifiers::InCaseToneConfig,
+            ControlCommandIdentifiers::InCaseToneVolume,
+            ControlCommandIdentifiers::CrownRotationDirection,
         ] {
             let (tx_sub, mut rx_sub) = tokio::sync::mpsc::unbounded_channel();
             aacp_manager
@@ -82,6 +90,58 @@ impl AirPodsDevice {
                             },
                         )),
                     ));
+                }
+            });
+        }
+
+        // Re-apply the user's remembered Volume Swipe choice when the device's
+        // first report (part of the init state dump) disagrees with it. Later
+        // changes are user intent and are persisted by send_control_command.
+        {
+            let (vs_tx, mut vs_rx) = tokio::sync::mpsc::unbounded_channel();
+            aacp_manager
+                .subscribe_to_control_command(ControlCommandIdentifiers::VolumeSwipeMode, vs_tx)
+                .await;
+            let aacp_vs = aacp_manager.clone();
+            let mac_str = mac_address.to_string();
+            tokio::spawn(async move {
+                let Some(value) = vs_rx.recv().await else {
+                    return;
+                };
+                let reported_on = value.first() == Some(&0x01);
+                let remembered = aacp_vs
+                    .state
+                    .lock()
+                    .await
+                    .devices
+                    .get(&mac_str)
+                    .and_then(|d| d.volume_swipe);
+                if let Some(want_on) = remembered
+                    && want_on != reported_on
+                {
+                    log::info!(
+                        "Re-applying remembered Volume Swipe = {} for {}",
+                        if want_on { "on" } else { "off" },
+                        mac_str
+                    );
+                    let byte = if want_on { 0x01 } else { 0x02 };
+                    if let Err(e) = aacp_vs
+                        .send_control_command(ControlCommandIdentifiers::VolumeSwipeMode, &[byte])
+                        .await
+                    {
+                        log::error!("Failed to re-apply Volume Swipe: {}", e);
+                        return;
+                    }
+                    // The device doesn't echo VolumeSwipeMode writes, so push
+                    // the applied state into the event stream ourselves.
+                    aacp_vs
+                        .emit_event(AACPEvent::ControlCommand(
+                            crate::bluetooth::aacp::ControlCommandStatus {
+                                identifier: ControlCommandIdentifiers::VolumeSwipeMode,
+                                value: vec![byte],
+                            },
+                        ))
+                        .await;
                 }
             });
         }
@@ -106,31 +166,53 @@ impl AirPodsDevice {
         });
 
         // ── Now send protocol packets (responses will be caught by channels above) ──
-        // Uses strict opcode matching: each step waits for the device to respond with
-        // a specific opcode (or times out after 500ms) before proceeding.
+        // Any send failure is fatal: the L2CAP link is dead or dying, and
+        // continuing produces a zombie session the TUI sees as a connected
+        // device with no data. The caller retries with a fresh socket instead.
+
+        // Subscribed before the first send so the liveness gate below cannot
+        // miss an early response.
+        let mut init_opcode_rx = aacp_manager.state.lock().await.opcode_tx.subscribe();
 
         info!("Sending handshake");
         if let Err(e) = aacp_manager.send_handshake().await {
-            error!("Failed to send handshake to AirPods device: {}", e);
+            return Self::fail_init(&aacp_manager, "handshake", e).await;
         }
         // Handshake has no specific AACP opcode response; wait for any packet
         let _ = Self::wait_for_any_opcode(&aacp_manager, 500).await;
 
         info!("Setting feature flags");
         if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
-            error!("Failed to set feature flags: {}", e);
+            return Self::fail_init(&aacp_manager, "feature flags", e).await;
         }
         let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
 
         info!("Requesting notifications");
         if let Err(e) = aacp_manager.send_notification_request().await {
-            error!("Failed to request notifications: {}", e);
+            return Self::fail_init(&aacp_manager, "notification request", e).await;
         }
-        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::REQUEST_NOTIFICATIONS, 500).await;
+        // Liveness gate: a healthy device starts streaming (battery info first)
+        // within ~200ms of the notifications request. Total silence means a
+        // wedged session that only ends in a peer reset; tear it down so the
+        // reconnect path retries with a fresh socket.
+        if tokio::time::timeout(Duration::from_secs(3), init_opcode_rx.recv())
+            .await
+            .is_err()
+        {
+            return Self::fail_init(
+                &aacp_manager,
+                "liveness gate",
+                bluer::Error {
+                    kind: bluer::ErrorKind::Failed,
+                    message: "device sent nothing within 3s of init".into(),
+                },
+            )
+            .await;
+        }
 
         info!("Sending SSL request");
         if let Err(e) = aacp_manager.send_ssl_request().await {
-            error!("Failed to send SSL request: {}", e);
+            return Self::fail_init(&aacp_manager, "SSL request", e).await;
         }
 
         if crate::devices::apple_models::needs_init_ext(product_id) {
@@ -140,7 +222,7 @@ impl AirPodsDevice {
             );
             let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
             if let Err(e) = aacp_manager.send_init_ext().await {
-                error!("Failed to send AapInitExt: {}", e);
+                return Self::fail_init(&aacp_manager, "AapInitExt", e).await;
             }
         }
 
@@ -149,7 +231,7 @@ impl AirPodsDevice {
             .send_proximity_keys_request(vec![ProximityKeyType::Irk, ProximityKeyType::EncKey])
             .await
         {
-            error!("Failed to request proximity keys: {}", e);
+            return Self::fail_init(&aacp_manager, "proximity keys request", e).await;
         }
         let _ = Self::wait_for_opcode(&aacp_manager, opcodes::PROXIMITY_KEYS_RSP, 500).await;
 
@@ -264,12 +346,7 @@ impl AirPodsDevice {
                         info!("AACP L2CAP connection lost for {}", mac_address);
                         // Request reconnect from bluetooth_main (if running in-process)
                         if let Some(ref rtx) = reconnect_tx_clone {
-                            let name = {
-                                // Try to get the current device name from the TUI state
-                                // Fall back to "AirPods" if unavailable
-                                "AirPods".to_string()
-                            };
-                            let _ = rtx.send((mac_address, name, product_id));
+                            let _ = rtx.send((mac_address, product_id));
                         }
                         break; // Exit event loop — this AirPodsDevice is dead
                     }
@@ -308,6 +385,21 @@ impl AirPodsDevice {
         // but not needed in the struct after initialization
         drop(media_controller);
         Ok(AirPodsDevice { aacp_manager })
+    }
+
+    /// Abort a half-dead init: close the L2CAP session (so the retry's fresh
+    /// connect doesn't race a lingering socket) and surface the failing step.
+    async fn fail_init(
+        aacp_manager: &AACPManager,
+        step: &str,
+        e: bluer::Error,
+    ) -> Result<Self, bluer::Error> {
+        error!("AACP init failed at {}: {}", step, e);
+        aacp_manager.disconnect().await;
+        Err(bluer::Error {
+            kind: bluer::ErrorKind::ConnectionAttemptFailed,
+            message: format!("init failed at {}: {}", step, e),
+        })
     }
 
     /// Wait for a specific opcode to arrive on the broadcast channel.

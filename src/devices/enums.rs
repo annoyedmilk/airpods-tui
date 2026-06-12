@@ -26,6 +26,10 @@ pub struct DeviceData {
     pub name: String,
     pub type_: DeviceType,
     pub information: Option<DeviceInformation>,
+    /// The user's last explicit Volume Swipe choice, re-applied on connect
+    /// when the device reports a different state.
+    #[serde(default)]
+    pub volume_swipe: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
