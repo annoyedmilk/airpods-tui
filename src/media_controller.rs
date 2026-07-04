@@ -572,155 +572,130 @@ fn pa_is_profile_available(
 
 // ── Async wrappers: send command + await oneshot reply ──
 
-async fn audio_cmd_is_a2dp(tx: &std::sync::mpsc::Sender<AudioCommand>, card_index: u32) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::IsA2dpAvailable {
+type AudioTx = std::sync::mpsc::Sender<AudioCommand>;
+
+/// Send one command to the PulseAudio thread and await its oneshot reply,
+/// returning `default` if the thread is gone.
+async fn audio_request<T>(
+    tx: &AudioTx,
+    default: T,
+    make: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> AudioCommand,
+) -> T {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(make(reply));
+    rx.await.unwrap_or(default)
+}
+
+async fn audio_cmd_is_a2dp(tx: &AudioTx, card_index: u32) -> bool {
+    audio_request(tx, false, |reply| AudioCommand::IsA2dpAvailable {
         card_index,
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_get_device_index(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    mac: &str,
-) -> Option<u32> {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::GetDeviceIndex {
-        mac: mac.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(None)
+async fn audio_cmd_get_device_index(tx: &AudioTx, mac: &str) -> Option<u32> {
+    let mac = mac.to_string();
+    audio_request(tx, None, |reply| AudioCommand::GetDeviceIndex {
+        mac,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_set_card_profile(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    card_index: u32,
-    profile: &str,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::SetCardProfile {
+async fn audio_cmd_set_card_profile(tx: &AudioTx, card_index: u32, profile: &str) -> bool {
+    let profile = profile.to_string();
+    audio_request(tx, false, |reply| AudioCommand::SetCardProfile {
         card_index,
-        profile: profile.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        profile,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_get_sink_volume(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-) -> Option<u32> {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::GetSinkVolume {
-        sink_name: sink_name.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(None)
+async fn audio_cmd_get_sink_volume(tx: &AudioTx, sink_name: &str) -> Option<u32> {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, None, |reply| AudioCommand::GetSinkVolume {
+        sink_name,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_transition_volume(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-    target: u32,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::TransitionVolume {
-        sink_name: sink_name.to_string(),
+async fn audio_cmd_transition_volume(tx: &AudioTx, sink_name: &str, target: u32) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::TransitionVolume {
+        sink_name,
         target,
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_get_sink_name_by_mac(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    mac: &str,
-) -> Option<String> {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::GetSinkNameByMac {
-        mac: mac.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(None)
+async fn audio_cmd_get_sink_name_by_mac(tx: &AudioTx, mac: &str) -> Option<String> {
+    let mac = mac.to_string();
+    audio_request(tx, None, |reply| AudioCommand::GetSinkNameByMac {
+        mac,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_is_profile_available(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    card_index: u32,
-    profile: &str,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::IsProfileAvailable {
+async fn audio_cmd_is_profile_available(tx: &AudioTx, card_index: u32, profile: &str) -> bool {
+    let profile = profile.to_string();
+    audio_request(tx, false, |reply| AudioCommand::IsProfileAvailable {
         card_index,
-        profile: profile.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        profile,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_set_default_sink(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::SetDefaultSink {
-        sink_name: sink_name.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+async fn audio_cmd_set_default_sink(tx: &AudioTx, sink_name: &str) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::SetDefaultSink {
+        sink_name,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_move_all_sink_inputs(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::MoveAllSinkInputs {
-        sink_name: sink_name.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+async fn audio_cmd_move_all_sink_inputs(tx: &AudioTx, sink_name: &str) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::MoveAllSinkInputs {
+        sink_name,
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_set_sink_mute(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-    mute: bool,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::SetSinkMute {
-        sink_name: sink_name.to_string(),
+async fn audio_cmd_set_sink_mute(tx: &AudioTx, sink_name: &str, mute: bool) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::SetSinkMute {
+        sink_name,
         mute,
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_suspend_sink(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-    suspend: bool,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::SuspendSinkByName {
-        sink_name: sink_name.to_string(),
+async fn audio_cmd_suspend_sink(tx: &AudioTx, sink_name: &str, suspend: bool) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::SuspendSinkByName {
+        sink_name,
         suspend,
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+        reply,
+    })
+    .await
 }
 
-async fn audio_cmd_has_active_sink_input(
-    tx: &std::sync::mpsc::Sender<AudioCommand>,
-    sink_name: &str,
-) -> bool {
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let _ = tx.send(AudioCommand::HasActiveSinkInput {
-        sink_name: sink_name.to_string(),
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or(false)
+async fn audio_cmd_has_active_sink_input(tx: &AudioTx, sink_name: &str) -> bool {
+    let sink_name = sink_name.to_string();
+    audio_request(tx, false, |reply| AudioCommand::HasActiveSinkInput {
+        sink_name,
+        reply,
+    })
+    .await
 }
 
 // ── MediaController ──
@@ -732,11 +707,6 @@ struct MediaControllerState {
     paused_by_app_services: Vec<String>,
     device_index: Option<u32>,
     cached_a2dp_profile: String,
-    old_in_ear_data: Vec<bool>,
-    user_played_the_media: bool,
-    i_paused_the_media: bool,
-    ear_detection_enabled: bool,
-    disconnect_when_not_wearing: bool,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
@@ -766,11 +736,6 @@ impl MediaControllerState {
             paused_by_app_services: Vec::new(),
             device_index: None,
             cached_a2dp_profile: String::new(),
-            old_in_ear_data: vec![false, false],
-            user_played_the_media: false,
-            i_paused_the_media: false,
-            ear_detection_enabled: true,
-            disconnect_when_not_wearing: true,
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
@@ -858,6 +823,16 @@ impl MediaController {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
+            // Exit when the L2CAP session is gone (recv_thread/disconnect
+            // clear the sender). Otherwise this loop outlives the session and
+            // every reconnect leaks a poll task, a PulseAudio thread, and the
+            // dead manager state - and stale loops keep re-activating the
+            // A2DP profile against live PulseAudio.
+            if aacp_manager.state.lock().await.sender.is_none() {
+                info!("AACP session closed, stopping playback listener");
+                break;
+            }
+
             let is_playing = self.check_if_playing_async().await;
 
             let mut state = self.state.lock().await;
@@ -896,7 +871,7 @@ impl MediaController {
                     continue;
                 }
 
-                // Disarm any pending handoff reclaim — Linux is now the active player.
+                // Disarm any pending handoff reclaim - Linux is now the active player.
                 {
                     let mut state = self.state.lock().await;
                     state.should_reclaim_on_none = false;
@@ -910,45 +885,77 @@ impl MediaController {
                 self.activate_a2dp_profile().await;
             }
         }
+        self.state.lock().await.playback_listener_running = false;
     }
 
-    async fn check_if_playing_async(&self) -> bool {
-        let Some(conn) = self.session_conn().await else {
-            return false;
-        };
-        let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
-            return false;
-        };
-        let Ok(names) = proxy.list_names().await else {
-            return false;
-        };
+    fn is_kdeconnect_service(service: &str) -> bool {
+        service.starts_with("org.mpris.MediaPlayer2.kdeconnect.mpris_")
+    }
 
+    /// All MPRIS player proxies on the session bus (kdeconnect ones excluded).
+    async fn mpris_players(&self) -> Vec<(String, zbus::Proxy<'static>)> {
+        let Some(conn) = self.session_conn().await else {
+            return Vec::new();
+        };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return Vec::new();
+        };
+        let Ok(names) = dbus.list_names().await else {
+            return Vec::new();
+        };
+        let mut players = Vec::new();
         for name in names {
-            let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.") {
-                continue;
-            }
-            if Self::is_kdeconnect_service(service) {
+            let service = name.as_str().to_string();
+            if !service.starts_with("org.mpris.MediaPlayer2.")
+                || Self::is_kdeconnect_service(&service)
+            {
                 continue;
             }
             if let Ok(p) = zbus::Proxy::new(
                 &conn,
-                service,
+                name,
                 "/org/mpris/MediaPlayer2",
                 "org.mpris.MediaPlayer2.Player",
             )
             .await
-                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing"
             {
+                players.push((service, p));
+            }
+        }
+        players
+    }
+
+    async fn check_if_playing_async(&self) -> bool {
+        for (_, p) in self.mpris_players().await {
+            if Self::is_playing(&p).await {
                 return true;
             }
         }
         false
     }
 
-    fn is_kdeconnect_service(service: &str) -> bool {
-        service.starts_with("org.mpris.MediaPlayer2.kdeconnect.mpris_")
+    async fn is_playing(p: &zbus::Proxy<'_>) -> bool {
+        matches!(
+            p.get_property::<String>("PlaybackStatus").await.as_deref(),
+            Ok("Playing")
+        )
+    }
+
+    /// Pause every playing MPRIS player; returns the services actually paused.
+    async fn pause_playing_players(&self) -> Vec<String> {
+        let mut paused = Vec::new();
+        for (service, p) in self.mpris_players().await {
+            if !Self::is_playing(&p).await {
+                continue;
+            }
+            if p.call_noreply("Pause", &()).await.is_ok() {
+                info!("Paused playback for: {}", service);
+                paused.push(service);
+            } else {
+                error!("Failed to pause {}", service);
+            }
+        }
+        paused
     }
 
     pub async fn handle_ear_detection(
@@ -988,24 +995,9 @@ impl MediaController {
             in_ear, old_all_out, new_has_at_least_one_in, new_all_out
         );
 
-        {
-            let state = self.state.lock().await;
-            if !state.ear_detection_enabled {
-                debug!("Ear detection disabled, skipping");
-                return;
-            }
-        }
-
         if new_has_at_least_one_in && old_all_out {
-            debug!("Condition met: buds inserted, activating A2DP and checking play state");
+            debug!("Condition met: buds inserted, activating A2DP");
             self.activate_a2dp_profile().await;
-            {
-                let mut state = self.state.lock().await;
-                if state.is_playing {
-                    state.user_played_the_media = true;
-                    debug!("Set user_played_the_media to true as media was playing");
-                }
-            }
         } else if new_all_out && !old_all_out {
             // Only on the ear-removal transition. Firing on every event where
             // both buds are already out (e.g. AirPods echo redundant ear state)
@@ -1013,23 +1005,7 @@ impl MediaController {
             // renegotiate the bluez profile and producing audible glitches.
             debug!("Condition met: ear-out transition, pausing media");
             self.pause().await;
-            {
-                let state = self.state.lock().await;
-                if state.disconnect_when_not_wearing {
-                    debug!("Disconnect when not wearing enabled, deactivating A2DP");
-                    drop(state);
-                    self.deactivate_a2dp_profile().await;
-                }
-            }
-        }
-
-        let reset_user_played = (old_in_ear_data.iter().any(|&b| !b)
-            && new_in_ear_data.iter().all(|&b| b))
-            || (new_in_ear_data.iter().any(|&b| !b) && old_in_ear_data.iter().all(|&b| b));
-        if reset_user_played {
-            debug!("Transition detected, resetting user_played_the_media");
-            let mut state = self.state.lock().await;
-            state.user_played_the_media = false;
+            self.deactivate_a2dp_profile().await;
         }
 
         info!(
@@ -1046,31 +1022,13 @@ impl MediaController {
             if in_ear {
                 debug!("Resuming media as buds are in ear");
                 self.resume().await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.i_paused_the_media = false;
-                }
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
                 self.pause().await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.i_paused_the_media = true;
-                }
             } else {
                 debug!("Playing media");
                 self.resume().await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.i_paused_the_media = false;
-                }
             }
-        }
-
-        {
-            let mut state = self.state.lock().await;
-            state.old_in_ear_data = new_in_ear_data;
-            debug!("Updated old_in_ear_data to {:?}", state.old_in_ear_data);
         }
     }
 
@@ -1196,80 +1154,20 @@ impl MediaController {
 
     async fn pause(&self) {
         debug!("Pausing playback");
-
-        let Some(conn) = self.session_conn().await else {
-            return;
-        };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
-            return;
-        };
-        let Ok(names) = dbus.list_names().await else {
-            return;
-        };
-        let mut paused_services = Vec::new();
-
-        for name in names {
-            let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.")
-                || Self::is_kdeconnect_service(service)
-            {
-                continue;
-            }
-            if let Ok(p) = zbus::Proxy::new(
-                &conn,
-                service,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-            )
-            .await
-                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing"
-            {
-                if p.call_noreply("Pause", &()).await.is_ok() {
-                    info!("Paused playback for: {}", service);
-                    paused_services.push(service.to_string());
-                } else {
-                    error!("Failed to pause {}", service);
-                }
-            }
-        }
-
-        if !paused_services.is_empty() {
-            info!("Paused {} media player(s) via DBus", paused_services.len());
-            let mut state = self.state.lock().await;
-            state.paused_by_app_services = paused_services;
-            state.is_playing = false;
-        } else {
+        let paused = self.pause_playing_players().await;
+        if paused.is_empty() {
             info!("No playing media players found to pause");
+            return;
         }
+        info!("Paused {} media player(s) via DBus", paused.len());
+        let mut state = self.state.lock().await;
+        state.paused_by_app_services = paused;
+        state.is_playing = false;
     }
 
     async fn mpris_call_first(&self, method: &str) {
-        let Some(conn) = self.session_conn().await else {
-            return;
-        };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
-            return;
-        };
-        let Ok(names) = dbus.list_names().await else {
-            return;
-        };
-        for name in names {
-            let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.")
-                || Self::is_kdeconnect_service(service)
-            {
-                continue;
-            }
-            if let Ok(p) = zbus::Proxy::new(
-                &conn,
-                service,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-            )
-            .await
-                && p.call_noreply(method, &()).await.is_ok()
-            {
+        for (service, p) in self.mpris_players().await {
+            if p.call_noreply(method, &()).await.is_ok() {
                 info!("{} for: {}", method, service);
                 break;
             }
@@ -1291,53 +1189,16 @@ impl MediaController {
         self.mpris_call_first("Previous").await;
     }
 
+    /// Pause everything without tracking the players for a later resume.
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
-
-        let Some(conn) = self.session_conn().await else {
-            return;
-        };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
-            return;
-        };
-        let Ok(names) = dbus.list_names().await else {
-            return;
-        };
-        let mut paused_count = 0;
-
-        for name in names {
-            let service = name.as_str();
-            if !service.starts_with("org.mpris.MediaPlayer2.")
-                || Self::is_kdeconnect_service(service)
-            {
-                continue;
-            }
-            if let Ok(p) = zbus::Proxy::new(
-                &conn,
-                service,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-            )
-            .await
-                && let Ok(status) = p.get_property::<String>("PlaybackStatus").await
-                && status == "Playing"
-            {
-                if p.call_noreply("Pause", &()).await.is_ok() {
-                    info!("Paused playback for: {}", service);
-                    paused_count += 1;
-                } else {
-                    error!("Failed to pause {}", service);
-                }
-            }
-        }
-
-        if paused_count > 0 {
+        let paused = self.pause_playing_players().await;
+        if !paused.is_empty() {
             info!(
                 "Paused {} media player(s) due to ownership loss",
-                paused_count
+                paused.len()
             );
-            let mut state = self.state.lock().await;
-            state.is_playing = false;
+            self.state.lock().await.is_playing = false;
         }
     }
 
@@ -1478,7 +1339,7 @@ impl MediaController {
 
     /// Force AirPods to issue a fresh AVDTP_START handshake by suspending and
     /// resuming the bluez sink. After a peer-device steal the sink is left in
-    /// A2DP-suspended state — `set_card_profile` is a no-op since the profile
+    /// A2DP-suspended state - `set_card_profile` is a no-op since the profile
     /// is unchanged, so the audio stream never restarts. Falls back to profile
     /// activation if the suspend path fails.
     async fn force_audio_stream_restart(&self) {
@@ -1758,5 +1619,38 @@ impl MediaController {
                 debug!("Unknown conversational awareness status: {}", status);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The listener must exit once the AACP session's sender is gone,
+    /// otherwise every reconnect leaks a poll task and a PulseAudio thread.
+    #[tokio::test]
+    async fn playback_listener_exits_when_session_closed() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        let mc = MediaController::new(
+            "AA:BB:CC:DD:EE:FF".into(),
+            "11:22:33:44:55:66".into(),
+            config,
+            None,
+        );
+        // Fresh manager, never connected: sender is None from the start,
+        // same state recv_thread/disconnect leave behind on session loss.
+        let manager = AACPManager::new();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+        mc.start_playback_listener(manager, control_tx).await;
+        assert!(mc.state.lock().await.playback_listener_running);
+
+        // First loop tick is after 500ms; allow a generous window.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mc.state.lock().await.playback_listener_running {
+                return;
+            }
+        }
+        panic!("playback listener did not stop after session close");
     }
 }

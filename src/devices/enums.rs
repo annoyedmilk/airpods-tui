@@ -7,14 +7,6 @@ pub enum DeviceType {
     AirPods,
 }
 
-impl Display for DeviceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviceType::AirPods => write!(f, "AirPods"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum DeviceInformation {
@@ -32,9 +24,10 @@ pub struct DeviceData {
     pub volume_swipe: Option<bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AirPodsNoiseControlMode {
     Off,
+    #[default]
     NoiseCancellation,
     Transparency,
     Adaptive,
@@ -111,10 +104,5 @@ mod tests {
             AirPodsNoiseControlMode::Transparency.to_string(),
             "Transparency"
         );
-    }
-
-    #[test]
-    fn device_type_display() {
-        assert_eq!(DeviceType::AirPods.to_string(), "AirPods");
     }
 }

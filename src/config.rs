@@ -5,15 +5,17 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Command to show volume OSD. `{}` is replaced with the signed delta (e.g. "+5" or "-3").
+    /// Command to pop the volume OSD after a stem swipe. `{}` is replaced
+    /// with "+0" (display only; `volume_set_command` applies the volume).
     pub volume_osd_command: Vec<String>,
-    /// Command to set absolute volume. `{}` is replaced with a 0.0–1.0 fraction.
+    /// Command to set absolute volume. `{}` is replaced with a 0.0-1.0 fraction.
     pub volume_set_command: Vec<String>,
     /// Optional command to restart the audio server (e.g. WirePlumber).
     /// Set to `None` (the default) to disable the automatic restart.
     pub restart_audio_server: Option<Vec<String>>,
-    /// Command to send a battery-low desktop notification.
-    /// `{}` is replaced with the component label and level, e.g. "Left battery: 18%".
+    /// Command to send a battery-low desktop notification. Fired by the
+    /// daemon at 20% and 10% while discharging; `{}` is replaced with the
+    /// component label and level, e.g. "Left battery: 18%".
     /// Set to `[]` to disable notifications.
     pub battery_alert_command: Vec<String>,
 }
@@ -76,7 +78,7 @@ fn dirs_path() -> PathBuf {
 
 /// Run a template command, replacing `{}` in each argument with `value`.
 ///
-/// Uses `Command::new()` with an argv vector — no shell expansion occurs,
+/// Uses `Command::new()` with an argv vector - no shell expansion occurs,
 /// so there is no shell-injection risk. The first element of `template` is
 /// executed directly as a binary path.
 pub fn run_template_cmd(template: &[String], value: &str) {

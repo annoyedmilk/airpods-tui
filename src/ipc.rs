@@ -117,7 +117,7 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::ConnectedDevices(_, _))));
                 }
                 // Transient events (StemPress, AudioSource, etc.) are not
-                // meaningful to replay — skip storing them in the snapshot.
+                // meaningful to replay - skip storing them in the snapshot.
                 _ => return,
             }
             snapshot.push(event.clone());
@@ -160,7 +160,7 @@ impl IpcServer {
     /// Run the IPC server, accepting connections on the Unix socket.
     pub async fn run(&self) -> std::io::Result<()> {
         let path = socket_path()?;
-        // Remove stale socket — ignore NotFound, log other errors
+        // Remove stale socket - ignore NotFound, log other errors
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {

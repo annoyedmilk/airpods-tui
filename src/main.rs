@@ -304,7 +304,7 @@ fn main() -> io::Result<()> {
         drop(app_rx);
         drop(cmd_rx);
         drop(cmd_tx);
-        // Keep ipc_rt alive — its spawned tasks handle the socket I/O
+        // Keep ipc_rt alive - its spawned tasks handle the socket I/O
         (Some(ipc_rt), ipc_event_rx, ipc_cmd_tx)
     } else {
         drop(ipc_rt);
@@ -453,8 +453,8 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
             }
             None => Duration::from_secs(60),
         };
-        // blocking_recv with a timeout via std::sync::mpsc isn't available on tokio unbounded,
-        // so we use a short poll to stay responsive while avoiding the 200ms busy-wait
+        // tokio's unbounded receiver has no blocking recv-with-timeout usable
+        // from sync code, so poll try_recv with short sleeps
         match app.rx.try_recv() {
             Ok(event) => {
                 // Process this event plus any others that have queued up
@@ -464,7 +464,7 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
                 }
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // No event available — sleep for a reasonable interval
+                // No event available - sleep for a reasonable interval
                 std::thread::sleep(remaining.min(Duration::from_secs(1)));
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
@@ -534,12 +534,12 @@ async fn avrcp_volume_monitor(config: config::Config) {
 
     loop {
         tokio::select! {
-            // Debounce timer fired — set the absolute target volume.
+            // Debounce timer fired - set the absolute target volume.
             () = &mut debounce_deadline, if pending_pct.is_some() => {
                 let new_pct = pending_pct.take().unwrap();
                 if applied_pct >= 0 {
                     if new_pct != applied_pct {
-                        // Pass a 0.0–1.0 fraction to volume_set_command (e.g. wpctl).
+                        // Pass a 0.0-1.0 fraction to volume_set_command (e.g. wpctl).
                         let fraction = format!("{:.4}", new_pct as f64 / 100.0);
                         config::run_template_cmd(&set_cmd, &fraction);
                         // Show OSD without changing volume (+0 = display only)
@@ -689,13 +689,7 @@ async fn bluez_connection_listener(
             .filter(|d| !d.name.is_empty())
             .map(|d| d.name.clone())
             .unwrap_or(bt_name);
-        let product_id =
-            zbus_get_property::<String>(&conn, &path_str, "org.bluez.Device1", "Modalias")
-                .await
-                .and_then(|m| crate::devices::apple_models::parse_modalias(&m))
-                .filter(|(v, _)| *v == crate::devices::apple_models::APPLE_VENDOR_ID)
-                .map(|(_, p)| p)
-                .unwrap_or(0);
+        let product_id = read_product_id(&addr_str).await;
         info!(
             "AirPods connected: {}, product_id=0x{:04x}, initializing",
             name, product_id
@@ -747,7 +741,7 @@ async fn try_airpods_init(
         let mut managers = ctx.device_managers.write().await;
         if managers.contains_key(&addr_str) {
             info!(
-                "Skipping init for {} — already connected or initializing",
+                "Skipping init for {} - already connected or initializing",
                 addr_str
             );
             return InitOutcome::AlreadyClaimed;
@@ -832,7 +826,7 @@ async fn bluetooth_main(
         avrcp_volume_monitor(vol_config).await;
     });
 
-    // Command dispatcher — receives (mac, DeviceCommand) from TUI
+    // Command dispatcher - receives (mac, DeviceCommand) from TUI
     let dm_cmd = device_managers.clone();
     let adapter_cmd = adapter.clone();
     tokio::spawn(async move {
@@ -851,7 +845,7 @@ async fn bluetooth_main(
                         if let Err(e) = aacp.send_rename_packet(&name).await {
                             log::error!("Failed to send rename: {}", e);
                         }
-                        // Set BlueZ alias with retry (no disconnect — avoids iPhone reclaiming the name)
+                        // Set BlueZ alias with retry (no disconnect - avoids iPhone reclaiming the name)
                         if let Ok(addr) = mac.parse::<Address>()
                             && let Ok(device) = adapter_cmd.device(addr)
                         {

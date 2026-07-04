@@ -49,7 +49,7 @@ impl AirPodsDevice {
 
         aacp_manager.set_event_channel(tx).await;
 
-        // Control command subscriptions — all forwarded to TUI via AppEvent
+        // Control command subscriptions - all forwarded to TUI via AppEvent
         for cmd_id in [
             ControlCommandIdentifiers::ListeningMode,
             ControlCommandIdentifiers::AllowOffOption,
@@ -146,7 +146,7 @@ impl AirPodsDevice {
             });
         }
 
-        // OwnsConnection — handle audio ownership loss
+        // OwnsConnection - handle audio ownership loss
         let (owns_connection_tx, mut owns_connection_rx) = tokio::sync::mpsc::unbounded_channel();
         aacp_manager
             .subscribe_to_control_command(
@@ -179,13 +179,13 @@ impl AirPodsDevice {
             return Self::fail_init(&aacp_manager, "handshake", e).await;
         }
         // Handshake has no specific AACP opcode response; wait for any packet
-        let _ = Self::wait_for_any_opcode(&aacp_manager, 500).await;
+        let _ = Self::wait_for_opcode(&aacp_manager, None, 500).await;
 
         info!("Setting feature flags");
         if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
             return Self::fail_init(&aacp_manager, "feature flags", e).await;
         }
-        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
+        let _ = Self::wait_for_opcode(&aacp_manager, Some(opcodes::SET_FEATURE_FLAGS), 500).await;
 
         info!("Requesting notifications");
         if let Err(e) = aacp_manager.send_notification_request().await {
@@ -220,7 +220,8 @@ impl AirPodsDevice {
                 "Sending AapInitExt for model 0x{:04x} (unlocks Adaptive ANC)",
                 product_id
             );
-            let _ = Self::wait_for_opcode(&aacp_manager, opcodes::SET_FEATURE_FLAGS, 500).await;
+            let _ =
+                Self::wait_for_opcode(&aacp_manager, Some(opcodes::SET_FEATURE_FLAGS), 500).await;
             if let Err(e) = aacp_manager.send_init_ext().await {
                 return Self::fail_init(&aacp_manager, "AapInitExt", e).await;
             }
@@ -233,7 +234,7 @@ impl AirPodsDevice {
         {
             return Self::fail_init(&aacp_manager, "proximity keys request", e).await;
         }
-        let _ = Self::wait_for_opcode(&aacp_manager, opcodes::PROXIMITY_KEYS_RSP, 500).await;
+        let _ = Self::wait_for_opcode(&aacp_manager, Some(opcodes::PROXIMITY_KEYS_RSP), 500).await;
 
         // ── Media controller setup ──
         let session = bluer::Session::new().await?;
@@ -348,25 +349,25 @@ impl AirPodsDevice {
                         if let Some(ref rtx) = reconnect_tx_clone {
                             let _ = rtx.send((mac_address, product_id));
                         }
-                        break; // Exit event loop — this AirPodsDevice is dead
+                        break; // Exit event loop - this AirPodsDevice is dead
                     }
                     AACPEvent::StemPress(press_type, _bud) => {
                         let controller = mc_clone.lock().await;
                         match press_type {
                             StemPressType::Single => {
-                                info!("Stem single press — toggling play/pause");
+                                info!("Stem single press - toggling play/pause");
                                 controller.toggle_play_pause().await;
                             }
                             StemPressType::Double => {
-                                info!("Stem double press — next track");
+                                info!("Stem double press - next track");
                                 controller.next_track().await;
                             }
                             StemPressType::Triple => {
-                                info!("Stem triple press — previous track");
+                                info!("Stem triple press - previous track");
                                 controller.previous_track().await;
                             }
                             StemPressType::Long => {
-                                debug!("Stem long press — ignored");
+                                debug!("Stem long press - ignored");
                             }
                         }
                     }
@@ -402,18 +403,18 @@ impl AirPodsDevice {
         })
     }
 
-    /// Wait for a specific opcode to arrive on the broadcast channel.
-    /// Returns Ok(()) when the expected opcode is received, or Err on timeout.
+    /// Wait for a specific opcode (or, with `None`, any packet at all) to
+    /// arrive on the broadcast channel. Err on timeout.
     async fn wait_for_opcode(
         aacp_manager: &AACPManager,
-        expected_opcode: u8,
+        expected: Option<u8>,
         timeout_ms: u64,
     ) -> Result<(), &'static str> {
         let mut rx = aacp_manager.state.lock().await.opcode_tx.subscribe();
         tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             loop {
                 if let Ok(opcode) = rx.recv().await
-                    && opcode == expected_opcode
+                    && expected.is_none_or(|e| e == opcode)
                 {
                     return;
                 }
@@ -421,19 +422,6 @@ impl AirPodsDevice {
         })
         .await
         .map_err(|_| "Timeout waiting for opcode")
-    }
-
-    /// Wait for any opcode to arrive (used for handshake which has no specific response).
-    async fn wait_for_any_opcode(
-        aacp_manager: &AACPManager,
-        timeout_ms: u64,
-    ) -> Result<(), &'static str> {
-        let mut rx = aacp_manager.state.lock().await.opcode_tx.subscribe();
-        tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            let _ = rx.recv().await;
-        })
-        .await
-        .map_err(|_| "Timeout waiting for any opcode")
     }
 }
 

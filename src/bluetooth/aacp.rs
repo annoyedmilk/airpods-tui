@@ -42,9 +42,29 @@ pub struct ControlCommandStatus {
     pub value: Vec<u8>,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
-pub enum ControlCommandIdentifiers {
+/// Generates the enum and its `TryFrom<u8>` parser from one variant list,
+/// so a new identifier cannot be added to one without the other.
+macro_rules! control_command_identifiers {
+    ($($name:ident = $val:literal),* $(,)?) => {
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+        pub enum ControlCommandIdentifiers {
+            $($name = $val),*
+        }
+
+        impl TryFrom<u8> for ControlCommandIdentifiers {
+            type Error = ();
+            fn try_from(value: u8) -> std::result::Result<Self, ()> {
+                match value {
+                    $($val => Ok(Self::$name),)*
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
+
+control_command_identifiers! {
     MicMode = 0x01,
     ButtonSendMode = 0x05,
     VoiceTrigger = 0x12,
@@ -81,95 +101,6 @@ pub enum ControlCommandIdentifiers {
     AutomaticConnectionConfig = 0x20,
     OwnsConnection = 0x06,
     InCaseToneVolume = 0x40,
-}
-
-impl TryFrom<u8> for ControlCommandIdentifiers {
-    type Error = ();
-    fn try_from(value: u8) -> std::result::Result<Self, ()> {
-        match value {
-            0x01 => Ok(Self::MicMode),
-            0x05 => Ok(Self::ButtonSendMode),
-            0x12 => Ok(Self::VoiceTrigger),
-            0x14 => Ok(Self::SingleClickMode),
-            0x15 => Ok(Self::DoubleClickMode),
-            0x16 => Ok(Self::ClickHoldMode),
-            0x17 => Ok(Self::DoubleClickInterval),
-            0x18 => Ok(Self::ClickHoldInterval),
-            0x1A => Ok(Self::ListeningModeConfigs),
-            0x1B => Ok(Self::OneBudAncMode),
-            0x1C => Ok(Self::CrownRotationDirection),
-            0x0D => Ok(Self::ListeningMode),
-            0x1E => Ok(Self::AutoAnswerMode),
-            0x1F => Ok(Self::ChimeVolume),
-            0x23 => Ok(Self::VolumeSwipeInterval),
-            0x24 => Ok(Self::CallManagementConfig),
-            0x25 => Ok(Self::VolumeSwipeMode),
-            0x26 => Ok(Self::AdaptiveVolumeConfig),
-            0x27 => Ok(Self::SoftwareMuteConfig),
-            0x28 => Ok(Self::ConversationDetectConfig),
-            0x29 => Ok(Self::Ssl),
-            0x2C => Ok(Self::HearingAid),
-            0x2E => Ok(Self::AutoAncStrength),
-            0x2F => Ok(Self::HpsGainSwipe),
-            0x30 => Ok(Self::HrmState),
-            0x31 => Ok(Self::InCaseToneConfig),
-            0x32 => Ok(Self::SiriMultitoneConfig),
-            0x33 => Ok(Self::HearingAssistConfig),
-            0x34 => Ok(Self::AllowOffOption),
-            0x39 => Ok(Self::StemConfig),
-            0x35 => Ok(Self::SleepDetectionConfig),
-            0x36 => Ok(Self::AllowAutoConnect),
-            0x0A => Ok(Self::EarDetectionConfig),
-            0x20 => Ok(Self::AutomaticConnectionConfig),
-            0x06 => Ok(Self::OwnsConnection),
-            0x40 => Ok(Self::InCaseToneVolume),
-            _ => Err(()),
-        }
-    }
-}
-
-impl std::fmt::Display for ControlCommandIdentifiers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            ControlCommandIdentifiers::MicMode => "Mic Mode",
-            ControlCommandIdentifiers::ButtonSendMode => "Button Send Mode",
-            ControlCommandIdentifiers::VoiceTrigger => "Voice Trigger",
-            ControlCommandIdentifiers::SingleClickMode => "Single Click Mode",
-            ControlCommandIdentifiers::DoubleClickMode => "Double Click Mode",
-            ControlCommandIdentifiers::ClickHoldMode => "Click Hold Mode",
-            ControlCommandIdentifiers::DoubleClickInterval => "Double Click Interval",
-            ControlCommandIdentifiers::ClickHoldInterval => "Click Hold Interval",
-            ControlCommandIdentifiers::ListeningModeConfigs => "Listening Mode Configs",
-            ControlCommandIdentifiers::OneBudAncMode => "One Bud ANC Mode",
-            ControlCommandIdentifiers::CrownRotationDirection => "Crown Rotation Direction",
-            ControlCommandIdentifiers::ListeningMode => "Listening Mode",
-            ControlCommandIdentifiers::AutoAnswerMode => "Auto Answer Mode",
-            ControlCommandIdentifiers::ChimeVolume => "Chime Volume",
-            ControlCommandIdentifiers::VolumeSwipeInterval => "Volume Swipe Interval",
-            ControlCommandIdentifiers::CallManagementConfig => "Call Management Config",
-            ControlCommandIdentifiers::VolumeSwipeMode => "Volume Swipe Mode",
-            ControlCommandIdentifiers::AdaptiveVolumeConfig => "Adaptive Volume Config",
-            ControlCommandIdentifiers::SoftwareMuteConfig => "Software Mute Config",
-            ControlCommandIdentifiers::ConversationDetectConfig => "Conversation Detect Config",
-            ControlCommandIdentifiers::Ssl => "SSL",
-            ControlCommandIdentifiers::HearingAid => "Hearing Aid",
-            ControlCommandIdentifiers::AutoAncStrength => "Auto ANC Strength",
-            ControlCommandIdentifiers::HpsGainSwipe => "HPS Gain Swipe",
-            ControlCommandIdentifiers::HrmState => "HRM State",
-            ControlCommandIdentifiers::InCaseToneConfig => "In Case Tone Config",
-            ControlCommandIdentifiers::SiriMultitoneConfig => "Siri Multitone Config",
-            ControlCommandIdentifiers::HearingAssistConfig => "Hearing Assist Config",
-            ControlCommandIdentifiers::AllowOffOption => "Allow Off Option",
-            ControlCommandIdentifiers::StemConfig => "Stem Config",
-            ControlCommandIdentifiers::SleepDetectionConfig => "Sleep Detection Config",
-            ControlCommandIdentifiers::AllowAutoConnect => "Allow Auto Connect",
-            ControlCommandIdentifiers::EarDetectionConfig => "Ear Detection Config",
-            ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
-            ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
-            ControlCommandIdentifiers::InCaseToneVolume => "In Case Tone Volume",
-        };
-        write!(f, "{}", name)
-    }
 }
 
 #[repr(u8)]
@@ -229,7 +160,7 @@ pub enum BatteryStatus {
     Charging = 1,
     NotCharging = 2,
     Disconnected = 4,
-    InUse = 5, // 0x05 — active/playing state on AirPods Pro 3rd gen
+    InUse = 5, // 0x05 - active/playing state on AirPods Pro 3rd gen
 }
 
 #[repr(u8)]
@@ -304,21 +235,15 @@ pub struct AACPManagerState {
     pub control_command_status_list: Vec<ControlCommandStatus>,
     pub control_command_subscribers:
         HashMap<ControlCommandIdentifiers, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
-    pub owns: bool,
-    pub old_connected_devices: Vec<ConnectedDevice>,
+    /// Peers reported by the previous CONNECTED_DEVICES packet, kept to
+    /// build the (old, new) diff for the next one.
     pub connected_devices: Vec<ConnectedDevice>,
-    pub audio_source: Option<AudioSource>,
-    pub battery_info: Vec<BatteryInfo>,
-    pub conversational_awareness_status: u8,
     pub ear_detection_left: Option<EarDetectionStatus>,
     pub ear_detection_right: Option<EarDetectionStatus>,
     pub primary_pod: Option<BatteryComponent>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
-    /// Notified after every successfully parsed incoming packet, allowing callers
-    /// to wait for a device response instead of using fixed sleeps.
-    pub packet_received: Arc<tokio::sync::Notify>,
     /// Broadcasts the opcode of every incoming packet for strict init sequencing.
     pub opcode_tx: tokio::sync::broadcast::Sender<u8>,
 }
@@ -333,19 +258,13 @@ impl AACPManagerState {
             sender: None,
             control_command_status_list: Vec::new(),
             control_command_subscribers: HashMap::new(),
-            owns: false,
-            old_connected_devices: Vec::new(),
             connected_devices: Vec::new(),
-            audio_source: None,
-            battery_info: Vec::new(),
-            conversational_awareness_status: 0,
             ear_detection_left: None,
             ear_detection_right: None,
             primary_pod: None,
             event_tx: None,
             devices,
             airpods_mac: None,
-            packet_received: Arc::new(tokio::sync::Notify::new()),
             opcode_tx: tokio::sync::broadcast::channel(16).0,
         }
     }
@@ -445,7 +364,7 @@ impl AACPManager {
 
     /// Tear down the L2CAP session deliberately: abort the recv/send tasks
     /// (dropping their socket handles closes it) and clear the sender.
-    /// Does not emit `ConnectionLost` — callers tearing down a half-dead
+    /// Does not emit `ConnectionLost` - callers tearing down a half-dead
     /// init drive their own retry.
     pub async fn disconnect(&self) {
         self.tasks.lock().await.abort_all();
@@ -487,25 +406,19 @@ impl AACPManager {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     ) {
         let mut state = self.state.lock().await;
-        state
-            .control_command_subscribers
-            .entry(identifier)
-            .or_default()
-            .push(tx);
-        // send initial value if available
+        // send initial value if the device already reported one
         if let Some(status) = state
             .control_command_status_list
             .iter()
             .find(|s| s.identifier == identifier)
         {
-            let _ = state
-                .control_command_subscribers
-                .get(&identifier)
-                .expect("subscriber list just inserted")
-                .last()
-                .expect("tx just pushed")
-                .send(status.value.clone());
+            let _ = tx.send(status.value.clone());
         }
+        state
+            .control_command_subscribers
+            .entry(identifier)
+            .or_default()
+            .push(tx);
     }
 
     pub async fn receive_packet(&self, packet: &[u8]) {
@@ -579,17 +492,16 @@ impl AACPManager {
                     .map(|b| b.component);
 
                 let mut state = self.state.lock().await;
-                state.battery_info = batteries.clone();
                 if let Some(p) = primary {
                     state.primary_pod = Some(p);
                 }
+                info!(
+                    "Received Battery Info: {:?} (primary_pod={:?})",
+                    batteries, state.primary_pod
+                );
                 if let Some(ref tx) = state.event_tx {
                     let _ = tx.send(AACPEvent::BatteryInfo(batteries));
                 }
-                info!(
-                    "Received Battery Info: {:?} (primary_pod={:?})",
-                    state.battery_info, state.primary_pod
-                );
             }
             opcodes::CONTROL_COMMAND => {
                 if payload.len() < 7 {
@@ -620,9 +532,6 @@ impl AACPManager {
                     } else {
                         state.control_command_status_list.push(status.clone());
                     }
-                    if identifier == ControlCommandIdentifiers::OwnsConnection {
-                        state.owns = value_bytes[0] != 0;
-                    }
                     if let Some(subscribers) = state.control_command_subscribers.get(&identifier) {
                         for sub in subscribers {
                             let _ = sub.send(value.clone());
@@ -644,6 +553,10 @@ impl AACPManager {
                 }
             }
             opcodes::EAR_DETECTION => {
+                if packet.len() < 8 {
+                    error!("Ear Detection packet too short: {}", hex::encode(packet));
+                    return;
+                }
                 let primary_status = packet[6];
                 let secondary_status = packet[7];
 
@@ -690,9 +603,7 @@ impl AACPManager {
             opcodes::CONVERSATION_AWARENESS => {
                 if packet.len() == 10 {
                     let status = packet[9];
-                    let mut state = self.state.lock().await;
-                    state.conversational_awareness_status = status;
-                    if let Some(ref tx) = state.event_tx {
+                    if let Some(ref tx) = self.state.lock().await.event_tx {
                         let _ = tx.send(AACPEvent::ConversationalAwareness(status));
                     }
                     info!("Received Conversation Awareness: {}", status);
@@ -873,12 +784,10 @@ impl AACPManager {
                 );
                 let typ = AudioSourceType::try_from(payload[8]).unwrap_or(AudioSourceType::None);
                 let audio_source = AudioSource { mac, r#type: typ };
-                let mut state = self.state.lock().await;
-                state.audio_source = Some(audio_source.clone());
-                if let Some(ref tx) = state.event_tx {
+                info!("Received Audio Source: {:?}", audio_source);
+                if let Some(ref tx) = self.state.lock().await.event_tx {
                     let _ = tx.send(AACPEvent::AudioSource(audio_source));
                 }
-                info!("Received Audio Source: {:?}", state.audio_source);
             }
             opcodes::CONNECTED_DEVICES => {
                 if payload.len() < 3 {
@@ -912,19 +821,15 @@ impl AACPManager {
                     let info2 = payload[base + 7];
                     devices.push(ConnectedDevice { mac, info1, info2 });
                 }
+                info!("Received Connected Devices: {:?}", devices);
                 let mut state = self.state.lock().await;
-                state.old_connected_devices = state.connected_devices.clone();
-                state.connected_devices = devices.clone();
+                let old = std::mem::replace(&mut state.connected_devices, devices.clone());
                 if let Some(ref tx) = state.event_tx {
-                    let _ = tx.send(AACPEvent::ConnectedDevices(
-                        state.old_connected_devices.clone(),
-                        devices,
-                    ));
+                    let _ = tx.send(AACPEvent::ConnectedDevices(old, devices));
                 }
-                info!("Received Connected Devices: {:?}", state.connected_devices);
             }
             0x11 => {
-                // Smart-Routing response — only the OwnershipToFalse notification matters.
+                // Smart-Routing response - only the OwnershipToFalse notification matters.
                 let packet_string = String::from_utf8_lossy(&payload[2..]);
                 if packet_string.contains("SetOwnershipToFalse") {
                     info!("Received OwnershipToFalse request via smart-routing response");
@@ -937,9 +842,6 @@ impl AACPManager {
             }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
-
-        // Notify anyone waiting for a device response
-        self.state.lock().await.packet_received.notify_waiters();
     }
 
     /// Inject a synthetic event into this manager's event stream. It is
@@ -965,7 +867,7 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    /// AapInitExt — sent to AirPods Pro 2/3/USB-C and AirPods 4 ANC to unlock Adaptive mode.
+    /// AapInitExt - sent to AirPods Pro 2/3/USB-C and AirPods 4 ANC to unlock Adaptive mode.
     /// Wire packet: 04 00 04 00 4d 00 0e 00 00 00 00 00 00 00
     pub async fn send_init_ext(&self) -> Result<()> {
         let data = [0x4d, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -1042,7 +944,6 @@ impl AACPManager {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
     }
-
 }
 
 /// Persist the device store (names, LE keys, remembered settings) to devices.json.
@@ -1078,10 +979,9 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             Err(e) => {
                 error!("Read error: {}", e);
                 debug!(
-                    "We have probably disconnected, clearing state variables (owns=false, connected_devices=empty, control_command_status_list=empty)."
+                    "We have probably disconnected, clearing connected_devices and control_command_status_list."
                 );
                 let mut state = manager.state.lock().await;
-                state.owns = false;
                 state.connected_devices.clear();
                 state.control_command_status_list.clear();
                 break;
@@ -1221,7 +1121,7 @@ mod tests {
             0x00,
             50,
             0xFE,
-            0x00, // invalid status — should be skipped
+            0x00, // invalid status - should be skipped
         ];
         m.receive_packet(&pkt(&payload)).await;
         match next_event(&mut rx).await.expect("event") {
@@ -1304,16 +1204,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_command_owns_connection_updates_owns_flag() {
+    async fn control_command_owns_connection_recorded_in_status_list() {
         let (m, _rx) = manager_with_events().await;
         // OwnsConnection (0x06) value = 1
         let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00];
         m.receive_packet(&pkt(&payload)).await;
-        assert!(m.state.lock().await.owns);
-
-        let payload = [opcodes::CONTROL_COMMAND, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00];
-        m.receive_packet(&pkt(&payload)).await;
-        assert!(!m.state.lock().await.owns);
+        let state = m.state.lock().await;
+        let owns = state
+            .control_command_status_list
+            .iter()
+            .find(|s| s.identifier == ControlCommandIdentifiers::OwnsConnection)
+            .expect("OwnsConnection recorded");
+        assert_eq!(owns.value, vec![0x01]);
     }
 
     #[tokio::test]
@@ -1418,6 +1320,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ear_detection_truncated_packet_does_not_emit() {
+        let (m, mut rx) = manager_with_events().await;
+        // Opcode alone (5 bytes) and one byte short of the two status
+        // bytes (7 bytes): both must be rejected without panicking.
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION])).await;
+        m.receive_packet(&pkt(&[opcodes::EAR_DETECTION, 0x00, 0x00]))
+            .await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    #[tokio::test]
     async fn conversation_awareness_parses() {
         let (m, mut rx) = manager_with_events().await;
         // Total packet length must equal 10 (header 4 + 6 payload)
@@ -1505,7 +1418,7 @@ mod tests {
     #[tokio::test]
     async fn connected_devices_parses_count_and_macs() {
         let (m, mut rx) = manager_with_events().await;
-        // opcode pad count [pad pad mac6 info1 info2]*count — base offset for first device is 5 (i=0 → base=5)
+        // opcode pad count [pad pad mac6 info1 info2]*count - base offset for first device is 5 (i=0 → base=5)
         let payload = [
             opcodes::CONNECTED_DEVICES,
             0x00,

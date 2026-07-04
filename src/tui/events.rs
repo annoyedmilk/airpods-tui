@@ -73,7 +73,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // Toggle conversation awareness directly
         KeyCode::Char('c') => toggle_conversation_awareness(app),
 
-        // Space/Enter — activate the focused row
+        // Space/Enter - activate the focused row
         KeyCode::Char(' ') | KeyCode::Enter => activate_row(app),
 
         // Device info popup
@@ -660,7 +660,7 @@ mod tests {
         let (mut app, mut cmd_rx) = mk_app(PRO2);
         // Switch to Settings
         handle_key(&mut app, key(KeyCode::Tab));
-        // First row for PRO2 is "Conversation Awareness" — toggle on
+        // First row for PRO2 is "Conversation Awareness" - toggle on
         handle_key(&mut app, key(KeyCode::Char(' ')));
         let (_, cmd) = cmd_rx.try_recv().unwrap();
         match cmd {

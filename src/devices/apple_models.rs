@@ -207,7 +207,7 @@ pub fn model_info(product_id: u16) -> AppleModelInfo {
             has_stem_controls: false,
             has_conversation_awareness: false,
         },
-        // Unknown Apple device — safe defaults
+        // Unknown Apple device - safe defaults
         _ => AppleModelInfo {
             name: "Apple Headphones",
             has_anc: true,

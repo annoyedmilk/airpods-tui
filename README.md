@@ -6,7 +6,7 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 
 ## Features
 
-- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications. The case reports its level whenever a pod sits inside; the last known value is retained while you wear both pods
+- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications at 20% and 10% (via the daemon). The case reports its level whenever a pod sits inside; the last known value is retained while you wear both pods
 - **Noise control**: Off, Transparency, Adaptive, Noise Cancellation (model-aware, Adaptive only shown on capable devices)
 - **Settings panel**, dynamically built per model:
   - Conversation Awareness (Pro 2, Pro 3, Pro USB-C, 4 ANC, Max 2)
@@ -24,8 +24,8 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 - **Stem press media controls** (play/pause, next/prev) wired through MPRIS
 - **Device renaming**: sets both the AACP name and the BlueZ alias
 - **Volume swipe synced** to system volume via configurable commands; your Volume Swipe on/off choice is remembered per device and re-applied on connect
-- **Auto audio rerouting** to AirPods on connect
-- **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership, resumes when the AirPods return to Linux
+- **Auto audio rerouting** to the AirPods sink when playback starts or the buds go in your ears
+- **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership and reclaims the audio session once the peer stops playing (playback stays paused until you press play)
 - **Waybar integration** via JSON output (`--waybar` / `--waybar-watch`)
 - **Background daemon** with Unix-socket IPC so the TUI launches instantly
 - **28 Apple/Beats models** with per-model capability detection; unknown Apple devices fall back to safe defaults
@@ -128,6 +128,8 @@ Add `"custom/airpods"` to your bar's `modules-right` (or wherever you prefer) an
 omarchy restart waybar
 ```
 
+For scripts that don't want to parse JSON, every battery update is also written to `$XDG_RUNTIME_DIR/airpods-battery.env` as `LEFT=`/`RIGHT=`/`CASE=`/`HEADPHONE=` lines.
+
 ## Usage
 
 ```
@@ -158,13 +160,15 @@ airpods-tui -v              # show version and exit
 Optional config at `~/.config/airpods-tui/config.toml`:
 
 ```toml
-# Show OSD on volume change ({} is replaced with the signed delta, e.g. "+5")
+# Pop the volume OSD after a stem swipe ({} receives "+0": display only,
+# the volume itself is applied by volume_set_command)
 volume_osd_command = ["swayosd-client", "--output-volume", "{}"]
 
 # Apply absolute volume ({} is replaced with a 0.0 to 1.0 fraction)
 volume_set_command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "{}"]
 
-# Battery-low desktop notification ({} is replaced with "Left battery: 18%" etc.)
+# Battery-low desktop notification at 20% and 10%, sent by the daemon
+# ({} is replaced with "Left battery: 18%" etc.)
 battery_alert_command = ["notify-send", "AirPods", "{}"]
 
 # Optional: run after the audio sink switches if you hit quality issues

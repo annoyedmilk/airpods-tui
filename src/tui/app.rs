@@ -44,7 +44,7 @@ impl FocusedSection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AirPodsDeviceState {
     pub name: String,
     pub model: Option<String>,
@@ -78,7 +78,7 @@ pub struct AirPodsDeviceState {
     pub hardware_revision: Option<String>,
     pub left_serial: Option<String>,
     pub right_serial: Option<String>,
-    // Auto ear detection (play/pause on remove) — None until reported
+    // Auto ear detection (play/pause on remove) - None until reported
     pub ear_detection_enabled: Option<bool>,
     /// Long-press cycle bitmask (0x1A): Off=1, NC=2, Transparency=4, Adaptive=8.
     pub listening_mode_configs: Option<u8>,
@@ -100,44 +100,10 @@ impl AirPodsDeviceState {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            model: None,
-            serial_number: None,
-            battery_left: None,
-            battery_right: None,
-            battery_case: None,
-            battery_headphone: None,
-            product_id: 0,
+            // Everything else defaults; the model-info lookup on
+            // DeviceConnected narrows has_anc for non-ANC models.
             has_anc: true,
-            has_adaptive: false,
-            listening_mode: AirPodsNoiseControlMode::NoiseCancellation,
-            allow_off_mode: false,
-            conversation_awareness: false,
-            auto_connect: None,
-            one_bud_anc: false,
-            volume_swipe: false,
-            adaptive_volume: false,
-            press_speed: None,
-            press_hold_duration: None,
-            tone_volume: None,
-            volume_swipe_length: None,
-            adaptive_noise_level: None,
-            mic_mode: None,
-            ear_left: None,
-            ear_right: None,
-            firmware: None,
-            hardware_revision: None,
-            left_serial: None,
-            right_serial: None,
-            ear_detection_enabled: None,
-            listening_mode_configs: None,
-            hold_left: None,
-            hold_right: None,
-            sleep_detection: None,
-            siri_voice_trigger: None,
-            in_case_tone: None,
-            in_case_tone_volume: None,
-            crown_reversed: None,
-            peer_devices: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -371,7 +337,7 @@ impl App {
         // Behavior
         items.push(SettingsItem::Enum {
             label: "Mic Mode",
-            // Wire values: 0x00 = Automatic, 0x01 = Right, 0x02 = Left —
+            // Wire values: 0x00 = Automatic, 0x01 = Right, 0x02 = Left -
             // option order matches so index == wire value.
             value: s.mic_mode.unwrap_or(0),
             options: &["Automatic", "Always Right", "Always Left"],
@@ -491,7 +457,7 @@ impl App {
                                 state.battery_right = Some((b.level, b.status));
                             }
                             BatteryComponent::Case => {
-                                // Only update if not disconnected — preserve last known good value
+                                // Only update if not disconnected - preserve last known good value
                                 if b.status != BatteryStatus::Disconnected {
                                     state.battery_case = Some((b.level, b.status));
                                 }
@@ -647,7 +613,6 @@ impl App {
             log::warn!("Failed to send rename '{}': {}", name, e);
         }
     }
-
 }
 
 /// Map the ClickHoldMode wire value (0x01 = Noise Control, 0x05 = Siri)
@@ -1066,7 +1031,7 @@ mod tests {
     #[test]
     fn aacp_event_for_unknown_mac_creates_default_state() {
         let (mut app, _) = mk_app();
-        // Events arrive before DeviceConnected — App should fabricate a state
+        // Events arrive before DeviceConnected - App should fabricate a state
         app.handle_event(aacp(
             MAC,
             AE::BatteryInfo(vec![BatteryInfo {
