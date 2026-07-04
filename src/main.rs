@@ -1,6 +1,7 @@
 mod bluetooth;
 mod config;
 mod devices;
+mod handoff;
 mod ipc;
 mod media_controller;
 mod tui;

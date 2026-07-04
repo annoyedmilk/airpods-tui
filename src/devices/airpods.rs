@@ -44,8 +44,6 @@ impl AirPodsDevice {
         // Otherwise the AirPods respond to handshake/notifications before we're listening,
         // and battery info, device info, and control command states are silently dropped.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (command_tx, mut command_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(ControlCommandIdentifiers, Vec<u8>)>();
 
         aacp_manager.set_event_channel(tx).await;
 
@@ -155,16 +153,6 @@ impl AirPodsDevice {
             )
             .await;
 
-        // Command dispatcher
-        let aacp_manager_clone = aacp_manager.clone();
-        tokio::spawn(async move {
-            while let Some((id, value)) = command_rx.recv().await {
-                if let Err(e) = aacp_manager_clone.send_control_command(id, &value).await {
-                    log::error!("Failed to send control command: {}", e);
-                }
-            }
-        });
-
         // ── Now send protocol packets (responses will be caught by channels above) ──
         // Any send failure is fatal: the L2CAP link is dead or dying, and
         // continuing produces a zombie session the TUI sees as a connected
@@ -252,24 +240,21 @@ impl AirPodsDevice {
         let mc_listener = media_controller.lock().await;
         let aacp_manager_clone_listener = aacp_manager.clone();
         mc_listener
-            .start_playback_listener(aacp_manager_clone_listener, command_tx.clone())
+            .start_playback_listener(aacp_manager_clone_listener)
             .await;
         drop(mc_listener);
 
-        // OwnsConnection handler. Pauses MPRIS but leaves the bluez profile in
-        // A2DP. Switching the card profile to "off" here forced wireplumber to
-        // renegotiate when audio came back, producing an audible quality drop.
-        // The AUDIO_SOURCE handler already pauses on peer-takes-audio without
-        // touching the profile, so this stays consistent with that path.
+        // OwnsConnection reports feed the handoff FSM. On loss it pauses
+        // MPRIS but leaves the bluez profile in A2DP: switching the profile
+        // to "off" here forced wireplumber to renegotiate when audio came
+        // back, producing an audible quality drop.
         let mc_clone_owns = media_controller.clone();
+        let aacp_owns = aacp_manager.clone();
         tokio::spawn(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
-                if !owns {
-                    info!("Lost ownership, pausing local media");
-                    let controller = mc_clone_owns.lock().await;
-                    controller.pause_all_media().await;
-                }
+                let controller = mc_clone_owns.lock().await;
+                controller.handle_owns_report(owns, &aacp_owns).await;
             }
         });
 
@@ -277,7 +262,6 @@ impl AirPodsDevice {
         let aacp_manager_clone_events = aacp_manager.clone();
         let local_mac_events = local_mac.clone();
         let app_tx_events = app_tx.clone();
-        let command_tx_clone = command_tx.clone();
         let reconnect_tx_clone = reconnect_tx;
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
@@ -325,13 +309,12 @@ impl AirPodsDevice {
                     }
                     AACPEvent::OwnershipToFalseRequest => {
                         info!(
-                            "Received ownership to false request. Setting ownership to false and pausing media."
+                            "Received ownership to false request. Releasing the session and pausing media."
                         );
-                        let _ = command_tx_clone
-                            .send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
                         let controller = mc_clone.lock().await;
-                        controller.pause_all_media().await;
-                        controller.deactivate_a2dp_profile().await;
+                        controller
+                            .handle_ownership_release(&aacp_manager_clone_events)
+                            .await;
                     }
                     AACPEvent::AudioSource(source) => {
                         debug!(
